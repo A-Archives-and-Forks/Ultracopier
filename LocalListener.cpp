@@ -190,7 +190,7 @@ void LocalListener::timeoutDectected()
             {
                 haveData=true;
                 ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"Timeout while recomposing data from connected clients: "+clientList.at(index).data.toHex().toStdString());
-                clientList.erase(clientList.cbegin());
+                clientList.erase(clientList.cbegin()+index);
             }
             else
                 index++;

@@ -48,6 +48,7 @@ CopyEngine::CopyEngine(FacilityInterface * facilityEngine) :
     mkFullPath(false),
     checksum(false),
     alwaysDoThisActionForFileExists(FileExistsAction::FileExists_NotSet),
+    alwaysDoThisActionForFileIsSame(FileExistsAction::FileExists_NotSet),
     alwaysDoThisActionForFileError(FileErrorAction::FileError_NotSet),
     alwaysDoThisActionForFolderError(FileErrorAction::FileError_NotSet),
     alwaysDoThisActionForFolderExists(FolderExistsAction::FolderExists_NotSet),
@@ -136,7 +137,7 @@ void CopyEngine::connectTheSignalsSlots()
     debugDialogWindow.show();
     debugDialogWindow.copyEngine=this;
     #endif
-    if(!connect(listThread,&ListThread::isInPause,				this,&CopyEngine::isInPause,				Qt::QueuedConnection))
+    if(!connect(listThread,&ListThread::isInPause,				this,&CopyEngine::listThreadIsInPause,	Qt::QueuedConnection))
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect isInPause()");
     if(!connect(listThread,&ListThread::actionInProgess,	this,&CopyEngine::actionInProgess,	Qt::QueuedConnection))
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect actionInProgess()");
@@ -196,6 +197,8 @@ void CopyEngine::connectTheSignalsSlots()
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect haveNeedPutAtBottom()");
 
 
+    if(!connect(this,&CopyEngine::signal_autoStartIfNeeded,			listThread,&ListThread::autoStartIfNeeded,	Qt::QueuedConnection))
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect signal_autoStartIfNeeded()");
     if(!connect(this,&CopyEngine::signal_pause,						listThread,&ListThread::pause,				Qt::QueuedConnection))
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect signal_pause()");
     if(!connect(this,&CopyEngine::signal_setSpeedLimitation,						listThread,&ListThread::setSpeedLimitation,				Qt::QueuedConnection))
@@ -317,7 +320,7 @@ bool CopyEngine::getOptionsEngine(QWidget * tempWidget)
             ui->comboBoxFileCollision->setCurrentIndex(2);
         break;
         case FileExists_OverwriteIfNotSameMdate:
-            ui->comboBoxFileCollision->setCurrentIndex(3);
+            ui->comboBoxFileCollision->setCurrentIndex(8);
         break;
         case FileExists_OverwriteIfNewer:
             ui->comboBoxFileCollision->setCurrentIndex(4);
@@ -329,10 +332,10 @@ bool CopyEngine::getOptionsEngine(QWidget * tempWidget)
             ui->comboBoxFileCollision->setCurrentIndex(6);
         break;
         case FileExists_OverwriteIfNotSameSize:
-            ui->comboBoxFileCollision->setCurrentIndex(6);
+            ui->comboBoxFileCollision->setCurrentIndex(7);
         break;
         case FileExists_OverwriteIfNotSameSizeAndDate:
-            ui->comboBoxFileCollision->setCurrentIndex(6);
+            ui->comboBoxFileCollision->setCurrentIndex(3);
         break;
         default:
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Error, unknow index, ignored");
@@ -558,8 +561,8 @@ bool CopyEngine::newMove(const std::vector<std::string> &sources)
     }
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"start");
     std::string destination;
-    if(!ui->defaultDestinationFolder->text().isEmpty() && QDir(ui->defaultDestinationFolder->text()).exists())
-        destination = ui->defaultDestinationFolder->text().toStdString();
+    if(!defaultDestinationFolder.empty() && QDir(QString::fromStdString(defaultDestinationFolder)).exists())
+        destination = defaultDestinationFolder;
     else
         destination = askDestination();
     if(destination.empty())
@@ -704,6 +707,15 @@ bool CopyEngine::userAddFile(const Ultracopier::CopyMode &mode)
 void CopyEngine::pause()
 {
     emit signal_pause();
+}
+
+void CopyEngine::listThreadIsInPause(const bool &isPaused)
+{
+    // remembered so a modal dialog (collision/error/disk space) restores the REAL pause state after
+    // its own temporary isInPause(true): reporting false there while the list thread was paused left
+    // the interface showing "Pause" on a paused engine, and its next click was a no-op
+    enginePaused=isPaused;
+    emit isInPause(isPaused);
 }
 
 void CopyEngine::resume()
@@ -1058,6 +1070,7 @@ void CopyEngine::setChecksum(const bool checksum)
 void CopyEngine::resetTempWidget()
 {
     uiIsInstalled=false;
+    enginePaused=false;
     tempWidget=NULL;
 }
 
@@ -1129,6 +1142,8 @@ void CopyEngine::newLanguageLoaded()
         ui->comboBoxFileCollision->setItemText(4,tr("Overwrite if newer"));
         ui->comboBoxFileCollision->setItemText(5,tr("Overwrite if older"));
         ui->comboBoxFileCollision->setItemText(6,tr("Rename"));
+        ui->comboBoxFileCollision->setItemText(7,tr("Overwrite if not same size"));
+        ui->comboBoxFileCollision->setItemText(8,tr("Overwrite if modification date differs"));
     }
     else
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Information,"ui not loaded!");

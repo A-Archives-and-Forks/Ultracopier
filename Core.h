@@ -113,6 +113,7 @@ class Core : public QObject
 
         /// \brief get the right copy instance (copy engine + interface), by signal emited from copy engine
         int indexCopySenderCopyEngine();
+        int indexOfEngine(const PluginInterface_CopyEngine * const engine) const;
         /// \brief get the right copy instance (copy engine + interface), by signal emited from interface
         int indexCopySenderInterface();
 
@@ -177,6 +178,8 @@ class Core : public QObject
         bool startNewTransferOneUniqueCopyEngine();
         void changeToUltimate();
     private slots:
+        /// \brief the log thread could not open its file: tell the user from the GUI thread
+        void logError(const QString &message);
         /// \brief the copy engine have canceled the transfer
         void copyInstanceCanceledByEngine();
         /// \brief the interface have canceled the transfer

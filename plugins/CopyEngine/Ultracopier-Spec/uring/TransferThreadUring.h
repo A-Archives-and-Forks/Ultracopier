@@ -47,6 +47,14 @@ private:
         enum State { Free, Reading, WriteReady, Writing } state;
     };
     PipelineBuffer pipelineBuffers[NUM_BUFFERS];
+    /// \brief buffers whose read/write was still owned by the kernel when the bounded cancel-drain gave up
+    /// (dead sector, stalled NFS/USB): never reused nor freed while the worker lives -- freed in the dtor
+    /// after wait(), when the ring is gone. Bounded: at most NUM_BUFFERS per stuck-I/O event.
+    std::vector<char*> orphanedBuffers;
+    /// \brief per-file generation carried in every read/write user_data: a late CQE of an orphaned op
+    /// from a PREVIOUS file is recognised and dropped instead of being credited to the current file's
+    /// buffer of the same index.
+    uint8_t fileGeneration;
 
     struct io_uring ring;
     bool ringInitialized;
@@ -58,14 +66,18 @@ private:
     int64_t writeOffset;
 
     // Tag types for CQE user_data to identify completions
-    // High 4 bits = op type, low 60 bits = buffer index
+    // High 4 bits = op type; for READ/WRITE bits 8..15 = file generation, bits 0..7 = buffer index
     static constexpr uint64_t OP_READ_TAG  = 0x1000000000000000ULL;
     static constexpr uint64_t OP_WRITE_TAG = 0x2000000000000000ULL;
     static constexpr uint64_t OP_FSYNC_TAG = 0x3000000000000000ULL;
     static constexpr uint64_t OP_OPEN_TAG  = 0x4000000000000000ULL;
     static constexpr uint64_t OP_CLOSE_TAG = 0x5000000000000000ULL;
+    static constexpr uint64_t OP_CANCEL_TAG= 0x6000000000000000ULL;
     static constexpr uint64_t OP_MASK      = 0xF000000000000000ULL;
     static constexpr uint64_t IDX_MASK     = 0x0FFFFFFFFFFFFFFFULL;
+    static constexpr uint64_t BUF_MASK     = 0xFFULL;
+    static constexpr unsigned GEN_SHIFT    = 8;
+    uint64_t dataTag(uint64_t op,int bufIdx) const { return op|((uint64_t)fileGeneration<<GEN_SHIFT)|(uint64_t)bufIdx; }
 
     // TransferThreadPipelined I/O hooks
     int openSourceFile() override;
@@ -80,6 +92,7 @@ private:
     void interruptTransferForStop() override {}
     bool remainSourceOpen() const override;
     bool remainDestinationOpen() const override;
+    void trimDestinationToContiguous() override;
     /// \brief futimens() on the still-open destFd using the cached source times (butime),
     /// avoiding the per-file reopen-to-utime() in doFilePostOperation.
     bool applyDateTimeOnOpenDestination() override;

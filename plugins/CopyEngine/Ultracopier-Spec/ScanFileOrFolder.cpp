@@ -385,7 +385,8 @@ void ScanFileOrFolder::run()
                 }
             } while(fileErrorAction==FileError_Retry);
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"source: "+TransferThread::internalStringTostring(source)+" is file or symblink, is_file: "+std::to_string(TransferThread::is_file(source)));
-            emit fileTransfer(source,destinationFinish+TransferThread::resolvedName(source),mode);
+            if(fileErrorAction!=FileError_Skip)
+                emit fileTransfer(source,destinationFinish+TransferThread::resolvedName(source),mode);
         }
         sourceIndex++;
     }
@@ -782,7 +783,7 @@ void ScanFileOrFolder::listFolder(INTERNALTYPEPATH source,INTERNALTYPEPATH desti
                 {
                     if(exclude.at(filters_index).apply_on==ApplyOn_folder || exclude.at(filters_index).apply_on==ApplyOn_fileAndFolder)
                     {
-                        if(std::regex_match(TransferThread::internalStringTostring(fileName),exclude.at(filters_index).regex))
+                        if(exclude.at(filters_index).regex.match(QString::fromStdString(TransferThread::internalStringTostring(fileName))).hasMatch())
                         {
                             excluded=true;
                             break;
@@ -799,7 +800,7 @@ void ScanFileOrFolder::listFolder(INTERNALTYPEPATH source,INTERNALTYPEPATH desti
                     {
                         if(include.at(filters_index).apply_on==ApplyOn_folder || include.at(filters_index).apply_on==ApplyOn_fileAndFolder)
                         {
-                            if(std::regex_match(TransferThread::internalStringTostring(fileName),include.at(filters_index).regex))
+                            if(include.at(filters_index).regex.match(QString::fromStdString(TransferThread::internalStringTostring(fileName))).hasMatch())
                             {
                                 included=true;
                                 break;
@@ -831,7 +832,7 @@ void ScanFileOrFolder::listFolder(INTERNALTYPEPATH source,INTERNALTYPEPATH desti
                 {
                     if(exclude.at(filters_index).apply_on==ApplyOn_file || exclude.at(filters_index).apply_on==ApplyOn_fileAndFolder)
                     {
-                        if(std::regex_match(TransferThread::internalStringTostring(fileName),exclude.at(filters_index).regex))
+                        if(exclude.at(filters_index).regex.match(QString::fromStdString(TransferThread::internalStringTostring(fileName))).hasMatch())
                         {
                             excluded=true;
                             break;
@@ -848,7 +849,7 @@ void ScanFileOrFolder::listFolder(INTERNALTYPEPATH source,INTERNALTYPEPATH desti
                     {
                         if(include.at(filters_index).apply_on==ApplyOn_file || include.at(filters_index).apply_on==ApplyOn_fileAndFolder)
                         {
-                            if(std::regex_match(TransferThread::internalStringTostring(fileName),include.at(filters_index).regex))
+                            if(include.at(filters_index).regex.match(QString::fromStdString(TransferThread::internalStringTostring(fileName))).hasMatch())
                             {
                                 included=true;
                                 break;

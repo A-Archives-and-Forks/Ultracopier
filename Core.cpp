@@ -22,6 +22,7 @@ Core::Core(CopyEngineManager *copyEngineList)
     connect(ThemesManager::themesManager,			&ThemesManager::theThemeNeedBeUnloaded,				this,	&Core::unloadInterface);
     connect(ThemesManager::themesManager,			&ThemesManager::theThemeIsReloaded,				this,	&Core::loadInterface, Qt::QueuedConnection);
     connect(&forUpateInformation,	&QTimer::timeout,						this,	&Core::periodicSynchronization);
+    connect(&log,			&LogThread::errorMessage,					this,	&Core::logError,Qt::QueuedConnection);
     #ifndef NOAUDIO
     audio=nullptr;
     #endif
@@ -55,6 +56,7 @@ void Core::newCopyWithoutDestination(const uint32_t &orderId,const std::vector<s
     if(openNewCopyEngineInstance(Ultracopier::Copy,false,protocolsUsedForTheSources)==-1)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Unable to get a copy engine instance");
+        emit copyRefused(orderId);// no reply at all counts as accepted for the file manager
         QMessageBox::critical(NULL,tr("Error"),tr("Unable to get a copy engine instance"));
         return;
     }
@@ -130,8 +132,14 @@ void Core::newTransfer(const Ultracopier::CopyMode &mode,const uint32_t &orderId
                         bool confirmed=true;
                         if(needConfirmation)
                         {
+                            PluginInterface_CopyEngine * const engine=copyList.at(index).engine;
                             QMessageBox::StandardButton reply = QMessageBox::question(copyList.at(index).interface,tr("Group window"),tr("Do you want group the transfer with another actual running transfer?"),QMessageBox::Yes|QMessageBox::No,QMessageBox::No);
                             confirmed=(reply==QMessageBox::Yes);
+                            // another window can finish and auto-close during the modal question: re-locate this one
+                            const int reindex=indexOfEngine(engine);
+                            if(reindex==-1)
+                                break;// that window is gone: open a new one below
+                            index=static_cast<unsigned int>(reindex);
                         }
                         if(confirmed)
                         {
@@ -164,6 +172,7 @@ void Core::newTransfer(const Ultracopier::CopyMode &mode,const uint32_t &orderId
     if(openNewCopyEngineInstance(mode,false,protocolsUsedForTheSources,protocolsUsedForTheDestination)==-1)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Unable to get a engine instance");
+        emit copyRefused(orderId);// no reply at all counts as accepted for the file manager
         QMessageBox::critical(NULL,tr("Error"),tr("Unable to get a engine instance"));
         return;
     }
@@ -200,6 +209,7 @@ void Core::newMoveWithoutDestination(const uint32_t &orderId,const std::vector<s
     if(openNewCopyEngineInstance(Ultracopier::Move,false,protocolsUsedForTheSources)==-1)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Unable to get a copy engine instance");
+        emit copyRefused(orderId);// no reply at all counts as accepted for the file manager
         QMessageBox::critical(NULL,tr("Error"),tr("Unable to get a copy engine instance"));
         return;
     }
@@ -323,8 +333,7 @@ void Core::loadInterface()
             {
                 if(!copyList.at(index).ignoreMode)
                     copyList.at(index).interface->forceCopyMode(copyList.at(index).mode);
-                connectInterfaceAndSync(static_cast<unsigned int>(copyList.size()-1));
-                copyList.at(index).engine->syncTransferList();
+                connectInterfaceAndSync(index);
                 index++;
             }
         }
@@ -617,6 +626,7 @@ void Core::actionInProgess(const Ultracopier::EngineActionInProgress &action)
                 index_sub_loop++;
             }
             copyList[index].orderId.clear();
+            copyList[index].haveError=false;// reported: a later order grouped here starts clean
             resetSpeedDetected(index);
         }
         #ifndef NOAUDIO
@@ -649,7 +659,8 @@ void Core::newFolderListing(const std::string &path)
     if(index!=-1)
     {
         copyList[index].folderListing=path;
-        copyList.at(index).interface->newFolderListing(path);
+        if(copyList.at(index).interface!=NULL)
+            copyList.at(index).interface->newFolderListing(path);
     }
 }
 
@@ -661,8 +672,17 @@ void Core::isInPause(const bool &isPaused)
         if(!isPaused)
             resetSpeedDetected(index);
         copyList[index].isPaused=isPaused;
-        copyList.at(index).interface->isInPause(isPaused);
+        if(copyList.at(index).interface!=NULL)
+            copyList.at(index).interface->isInPause(isPaused);
     }
+}
+
+int Core::indexOfEngine(const PluginInterface_CopyEngine * const engine) const
+{
+    for(unsigned int index=0;index<copyList.size();index++)
+        if(copyList.at(index).engine==engine)
+            return static_cast<int>(index);
+    return -1;
 }
 
 /// \brief get the right copy instance (copy engine + interface), by signal emited from copy engine
@@ -1021,6 +1041,14 @@ uint8_t Core::fileCatNumber(uint64_t size)
 }
 
 /// \brief the copy engine have canceled the transfer
+void Core::logError(const QString &message)
+{
+    //never modal: the log is auxiliary, a copy must not wait for a click on this box
+    QMessageBox *box=new QMessageBox(QMessageBox::Critical,tr("Error"),message,QMessageBox::Ok);
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->show();
+}
+
 void Core::copyInstanceCanceledByEngine()
 {
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"start");
@@ -1096,7 +1124,8 @@ void Core::error(const std::string &path,const uint64_t &size,const uint64_t &mt
     if(index!=-1)
     {
         copyList[index].haveError=true;
-        copyList.at(index).interface->errorDetected();
+        if(copyList.at(index).interface!=NULL)
+            copyList.at(index).interface->errorDetected();
     }
     else
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"unable to locate the copy engine sender");
@@ -1320,12 +1349,15 @@ void Core::urlDropped(const std::vector<std::string> &urls)
         {
             if(copyList.at(index).ignoreMode)
             {
+                PluginInterface_CopyEngine * const engine=copyList.at(index).engine;
                 QMessageBox::StandardButton reply=QMessageBox::question(copyList.at(index).interface,tr("Transfer mode"),
                            tr("Do you want to copy? If no, it will be moved."),QMessageBox::Yes|QMessageBox::No|QMessageBox::Cancel,QMessageBox::Cancel);
+                if(indexOfEngine(engine)==-1)
+                    return;// the window closed during the modal question
                 if(reply==QMessageBox::Yes)
-                    copyList.at(index).engine->newCopy(sources);
+                    engine->newCopy(sources);
                 if(reply==QMessageBox::No)
-                    copyList.at(index).engine->newMove(sources);
+                    engine->newMove(sources);
             }
             else
             {

@@ -81,17 +81,15 @@ def run(backends=None, memcheck=H.NONE) -> bool:
                TSAN_OPTIONS=("halt_on_error=0:report_thread_leaks=0:"
                              f"suppressions={_SUPP}:log_path={logdir}/tsan"))
     try:
-        r = subprocess.run([binp, src, dest], env=env, capture_output=True, text=True, timeout=900)
+        r, abort = K.run_tsan([binp, src, dest], env, 900, logdir)
     except subprocess.TimeoutExpired:
-        subprocess.run(["pkill", "-9", "-x", "engine_api_test"], capture_output=True)
         print("    [tsan_scheduler_reset] FAIL: timed out (livelock under TSan?)")
         shutil.rmtree(logdir, ignore_errors=True); shutil.rmtree(src, ignore_errors=True)
         return False
-    subprocess.run(["pkill", "-9", "-x", "engine_api_test"], capture_output=True)
 
     problems = []
     if r.returncode != 0:
-        problems.append(f"rc={r.returncode} (a TSan registry CHECK crash also lands here); "
+        problems.append(f"rc={r.returncode}; libtsan abort: {abort or 'none'}; "
                         f"stderr tail: {r.stderr[-200:]}")
     total = ours = 0
     our_sample = ""

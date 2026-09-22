@@ -19,6 +19,12 @@ uint8_t stringtouint8(const std::string &string,bool *ok)
     //std::stoul returns unsigned long: holding it in a narrower type truncated the value
     //before the range test below, so e.g. "4294967296" came back as 0 with ok=true
     unsigned long tempValue;
+    if(string.find('-')!=std::string::npos)//stoul("-1") wraps instead of failing
+    {
+        if(Q_LIKELY(ok!=NULL))
+            *ok=false;
+        return 0;
+    }
     try {
       tempValue = std::stoul(string);
     }
@@ -81,6 +87,12 @@ uint16_t stringtouint16(const std::string &string,bool *ok)
     //std::stoul returns unsigned long: holding it in a narrower type truncated the value
     //before the range test below, so e.g. "4294967296" came back as 0 with ok=true
     unsigned long tempValue;
+    if(string.find('-')!=std::string::npos)//stoul("-1") wraps instead of failing
+    {
+        if(Q_LIKELY(ok!=NULL))
+            *ok=false;
+        return 0;
+    }
     try {
       tempValue = std::stoul(string);
     }
@@ -143,6 +155,12 @@ uint32_t stringtouint32(const std::string &string,bool *ok)
     //unsigned long, and the range test the #else branch below already had: without it
     //std::stoul("4294967296") silently truncated to 0 and reported ok=true
     unsigned long tempValue;
+    if(string.find('-')!=std::string::npos)//stoul("-1") wraps instead of failing
+    {
+        if(Q_LIKELY(ok!=NULL))
+            *ok=false;
+        return 0;
+    }
     try {
       tempValue = std::stoul(string);
     }
@@ -234,6 +252,12 @@ uint64_t stringtouint64(const std::string &string,bool *ok)
 {
     #ifdef __EXCEPTIONS
     uint64_t tempValue;
+    if(string.find('-')!=std::string::npos)//stoul("-1") wraps instead of failing
+    {
+        if(Q_LIKELY(ok!=NULL))
+            *ok=false;
+        return 0;
+    }
     try {
       tempValue = std::stoull(string);
     }

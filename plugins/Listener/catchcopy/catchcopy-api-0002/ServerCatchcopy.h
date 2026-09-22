@@ -63,6 +63,7 @@ class ServerCatchcopy : public QObject
             std::string name;
         };
         QList<Client> clientList;
+        int indexOfClient(const uint32_t id) const;
         struct LinkGlobalToLocalClient
         {
             uint32_t idClient;

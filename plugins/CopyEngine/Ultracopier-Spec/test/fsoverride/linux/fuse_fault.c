@@ -11,6 +11,10 @@
  *     UC_FUSE_FAULT=<substr>:<off>:<n> reads of a path containing <substr> succeed up to <off> bytes,
  *                                      then fail EIO for <n> attempts (unplugged), then succeed. PER-PATH.
  *     UC_FUSE_READLOG_MATCH=<substr> / UC_FUSE_READLOG_PATH=<file>  count+flush read bytes (resume proof).
+ *     UC_FUSE_DELAY=<substr>:<ms>       every read of a path containing <substr> at/after UC_FUSE_FAULT's
+ *                                      offset (0 when unset) is served only after <ms> ms: a SLOW device
+ *                                      whose in-flight reads outlive the engine's error handling of a
+ *                                      sibling chunk -- the stale-I/O isolation reproducer for io_uring.
  *
  *   WRITE corruption (dest-side, SILENT -- must be caught by transferChecksum):
  *     UC_FUSE_WFAULT=<substr>:<off>    a write to a path containing <substr> that covers byte <off> has
@@ -47,6 +51,7 @@
 
 static char g_backing[4096];
 static char g_fault_sub[512];   static long long g_fault_off=0;   static long g_fault_n=0;
+static char g_delay_sub[512];   static long long g_delay_ms=0;
 static char g_wfault_sub[512];  static long long g_wfault_off=-1;
 static char g_wfail_sub[512];   static long long g_wfail_off=0;   static long g_wfail_n=0;
 static char g_openfail_sub[512];   /* open() of a matching path -> ENOENT, but getattr still succeeds:
@@ -124,6 +129,8 @@ static int ff_create(const char *path,mode_t mode,struct fuse_file_info *fi){
 static int ff_read(const char *path,char *buf,size_t size,off_t off,struct fuse_file_info *fi){
     /* fault at/after the disconnect offset (so the readable prefix is delivered first) */
     if(off>=g_fault_off && should_fail(path)) return -EIO;
+    if(g_delay_sub[0] && g_delay_ms>0 && off>=g_fault_off && strstr(path,g_delay_sub)!=NULL)
+        usleep((useconds_t)(g_delay_ms*1000));
     ssize_t r=pread((int)fi->fh,buf,size,off); if(r<0) return -errno;
     account(path,r); return (int)r;
 }
@@ -217,6 +224,8 @@ int main(int argc,char *argv[])
             char *c1=strrchr(tmp,':'); if(c1){*c1='\0'; g_wfail_off=strtoll(c1+1,NULL,10);}}
         strncpy(g_wfail_sub,tmp,sizeof(g_wfail_sub)-1);
     }
+    const char *dl=getenv("UC_FUSE_DELAY");
+    if(dl) split_last(dl,g_delay_sub,sizeof(g_delay_sub),&g_delay_ms);
     const char *of=getenv("UC_FUSE_OPENFAIL"); if(of) strncpy(g_openfail_sub,of,sizeof(g_openfail_sub)-1);
     const char *lm=getenv("UC_FUSE_READLOG_MATCH"); if(lm) strncpy(g_log_match,lm,sizeof(g_log_match)-1);
     const char *lp=getenv("UC_FUSE_READLOG_PATH");  if(lp) strncpy(g_log_path,lp,sizeof(g_log_path)-1);

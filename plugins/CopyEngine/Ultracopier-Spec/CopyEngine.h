@@ -51,6 +51,7 @@ private:
     QWidget *               tempWidget;
     Ui::copyEngineOptions *	ui;
     bool                    uiIsInstalled;
+    bool                    enginePaused;
     QWidget *               uiinterface;
     Filters *               filters;
     RenamingRules *			renamingRules;
@@ -75,6 +76,7 @@ private:
     bool                    mkFullPath;
     bool                    checksum;
     FileExistsAction		alwaysDoThisActionForFileExists;
+    FileExistsAction		alwaysDoThisActionForFileIsSame;//source==destination: never rewrites the policy of different files
     FileErrorAction			alwaysDoThisActionForFileError;
     FileErrorAction			alwaysDoThisActionForFolderError;
     FolderExistsAction		alwaysDoThisActionForFolderExists;
@@ -310,6 +312,7 @@ public slots:
     /// \brief need retranslate the insterface
     void newLanguageLoaded();
 private slots:
+    void listThreadIsInPause(const bool &isPaused);
     void setComboBoxFolderCollision(FolderExistsAction action,bool changeComboBox=true);
     void setComboBoxFolderError(FileErrorAction action,bool changeComboBox=true);
     void warningTransferList(const std::string &warning);
@@ -318,6 +321,7 @@ signals:
     //action on the copy
     void signal_pause() const;
     void signal_resume() const;
+    void signal_autoStartIfNeeded() const;
     void signal_skip(const uint64_t &id) const;
     void signal_setSpeedLimitation(const int64_t &speedLimitation);
 

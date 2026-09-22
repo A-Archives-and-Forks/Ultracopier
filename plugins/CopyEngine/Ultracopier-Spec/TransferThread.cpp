@@ -340,6 +340,27 @@ bool TransferThread::isSame()
         }
     }
     #endif
+    #ifdef Q_OS_WIN32
+    if(!sameString && GetFileAttributesW(toFinalPath(destination).c_str())!=INVALID_FILE_ATTRIBUTES)
+    {
+        // the same file reached through a junction, symlink or hard link: same volume + same file index
+        const HANDLE hd=CreateFileW(toFinalPath(destination).c_str(),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
+        if(hd!=INVALID_HANDLE_VALUE)
+        {
+            const HANDLE hs=CreateFileW(toFinalPath(source).c_str(),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
+            if(hs!=INVALID_HANDLE_VALUE)
+            {
+                BY_HANDLE_FILE_INFORMATION is,id;
+                if(GetFileInformationByHandle(hs,&is) && GetFileInformationByHandle(hd,&id)
+                        && is.dwVolumeSerialNumber==id.dwVolumeSerialNumber
+                        && is.nFileIndexHigh==id.nFileIndexHigh && is.nFileIndexLow==id.nFileIndexLow)
+                    aliasedSameFile=true;
+                CloseHandle(hs);
+            }
+            CloseHandle(hd);
+        }
+    }
+    #endif
     if(aliasedSameFile)
     {
         // Copying/moving a file ONTO ITSELF (reached via a symlink alias or hardlink) is a NO-OP: the
@@ -401,7 +422,9 @@ bool TransferThread::destinationExists()
 
     bool destinationExists=false;
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] time to first FS access");
-    destinationExists=is_file(destination);
+    // a symlink AT the destination path counts as existing too: open(O_CREAT) would follow it and
+    // silently overwrite its TARGET without ever consulting the collision policy (Skip/Ask/if-newer)
+    destinationExists=is_file(destination) || is_symlink(destination);
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] finish first FS access: "+std::to_string(destinationExists));
     if(destinationExists)
     {
@@ -623,10 +646,11 @@ std::string TransferThread::resolvedName(const std::string &inode)
         return inode.substr(lastPos+1);
     if(inode.size()==1)
         return "root";
-    const std::string::size_type &previousLastPos=inode.rfind('/',inode.size()-2);
-    if((lastPos-2)==previousLastPos || previousLastPos == std::string::npos)
+    const std::string::size_type previousLastPos=inode.rfind('/',inode.size()-2);
+    const std::string::size_type start=(previousLastPos==std::string::npos)?0:previousLastPos+1;
+    if(start>=lastPos)//"//": an empty last component
         return "root";
-    return inode.substr(previousLastPos+1,lastPos-previousLastPos-1);
+    return inode.substr(start,lastPos-start);
 }
 
 #ifdef Q_OS_WIN32
@@ -645,10 +669,11 @@ std::wstring TransferThread::resolvedName(const std::wstring &inode)
         return inode.substr(lastPos+1);
     if(inode.size()==1)
         return L"root";
-    const std::wstring::size_type &previousLastPos=inode.rfind(L'/',inode.size()-2);
-    if((lastPos-2)==previousLastPos || previousLastPos == std::wstring::npos)
+    const std::wstring::size_type previousLastPos=inode.rfind(L'/',inode.size()-2);
+    const std::wstring::size_type start=(previousLastPos==std::wstring::npos)?0:previousLastPos+1;
+    if(start>=lastPos)//"//": an empty last component
         return L"root";
-    return inode.substr(previousLastPos+1,lastPos-previousLastPos-1);
+    return inode.substr(start,lastPos-start);
 }
 
 INTERNALTYPEPATH TransferThread::getSourcePath() const
@@ -1290,11 +1315,14 @@ bool TransferThread::readSourceFilePermissions(const INTERNALTYPEPATH &source)
 bool TransferThread::writeDestinationFilePermissions(const INTERNALTYPEPATH &destination)
 {
     #ifdef Q_OS_UNIX
-    if(chmod(TransferThread::internalStringTostring(destination).c_str(), permissions.st_mode)!=0)
-        return false;
+    // chown FIRST: the kernel clears setuid/setgid on every chown, so a chmod done before it lost those
+    // bits. The mode is applied even when the chown fails (EPERM for a non-root user is the normal case).
+    bool ok=true;
     if(chown(TransferThread::internalStringTostring(destination).c_str(), permissions.st_uid, permissions.st_gid)!=0)
-        return false;
-    return true;
+        ok=false;
+    if(chmod(TransferThread::internalStringTostring(destination).c_str(), permissions.st_mode)!=0)
+        ok=false;
+    return ok;
     #else
     // PERF NOTE (measured 2026-07-25, Win10 laptop, 52209-file corpus): this per-file reopen+set is
     // the whole cost of the ACL pass -- 11.4s of a 19.4s copy (~219 us/file), and it is what makes

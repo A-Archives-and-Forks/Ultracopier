@@ -50,6 +50,7 @@ private slots:
     void newOptionValue(const std::string &group,const std::string &name,const std::string &value);
 signals:
     void newData(const std::string &text) const;
+    void errorMessage(const QString &message) const;//shown by Core on the GUI thread: this runs on its own thread
 private:
     std::string data;
     std::string transfer_format;

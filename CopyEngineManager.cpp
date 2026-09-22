@@ -397,6 +397,7 @@ bool CopyEngineManager::protocolsSupportedByTheCopyEngine(PluginInterface_CopyEn
             }
             return true;
         }
+        index++;
     }
     return false;
 }

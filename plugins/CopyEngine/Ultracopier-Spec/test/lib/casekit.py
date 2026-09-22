@@ -42,6 +42,38 @@ def fs_so() -> str:
     return str(out)
 
 
+def tsan_abort_line(logdir) -> str:
+    """First libtsan-side abort line in a TSan log dir: 'FATAL: ThreadSanitizer' (shadow/ASLR mapping
+    clash at exec) or the thread-registry 'CHECK failed' (pthread_t reuse of Qt's detached threads).
+    Both are failures of the sanitizer runtime, not of the engine; '' when none."""
+    import glob
+    for f in sorted(glob.glob(os.path.join(str(logdir), "tsan*"))):
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                if "FATAL: ThreadSanitizer" in line or "CHECK failed" in line:
+                    return line.strip()[:220]
+    return ""
+
+
+def run_tsan(argv, env, timeout, logdir):
+    """Run a TSan-instrumented driver (killing stragglers). On a libtsan abort (tsan_abort_line) the
+    log dir is wiped and the run retried ONCE, the abort line printed either way; a second abort, a
+    real crash (DEADLYSIGNAL) or a race report are never retried. Returns (CompletedProcess, abort)."""
+    name = os.path.basename(argv[0])
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
+        finally:
+            subprocess.run(["pkill", "-9", "-x", name], capture_output=True)
+        abort = tsan_abort_line(logdir)
+        if not abort or attempt == 2:
+            return r, abort
+        print(f"      [tsan] libtsan aborted (retrying once): {abort}")
+        for f in os.listdir(str(logdir)):
+            os.remove(os.path.join(str(logdir), f))
+    return r, abort
+
+
 def with_scenario(scenario: str) -> None:
     """Set UC_FS_SCENARIO in os.environ (the harness forwards it to the binary).
     Pass '' to disable. Convenience so cases don't poke os.environ directly."""

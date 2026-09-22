@@ -51,9 +51,14 @@ void CopyEngine::fileAlreadyExists(INTERNALTYPEPATH source,INTERNALTYPEPATH dest
     if(isSame)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"file is same: "+TransferThread::internalStringTostring(source));
-        FileExistsAction tempFileExistsAction=alwaysDoThisActionForFileExists;
-        if(tempFileExistsAction==FileExists_Overwrite || tempFileExistsAction==FileExists_OverwriteIfNewer || tempFileExistsAction==FileExists_OverwriteIfNotSameMdate || tempFileExistsAction==FileExists_OverwriteIfOlder)
-            tempFileExistsAction=FileExists_NotSet;
+        FileExistsAction tempFileExistsAction=alwaysDoThisActionForFileIsSame;
+        if(tempFileExistsAction==FileExists_NotSet)
+        {
+            //no same-file choice yet: a global Skip/Rename still applies, overwriting a file with itself never does
+            tempFileExistsAction=alwaysDoThisActionForFileExists;
+            if(tempFileExistsAction!=FileExists_Skip && tempFileExistsAction!=FileExists_Rename)
+                tempFileExistsAction=FileExists_NotSet;
+        }
         switch(tempFileExistsAction)
         {
             case FileExists_Skip:
@@ -81,29 +86,15 @@ void CopyEngine::fileAlreadyExists(INTERNALTYPEPATH source,INTERNALTYPEPATH dest
                 const bool dialogAlways=dialog->getAlways();
                 const std::string dialogNewName=dialog->getNewName();
                 delete dialog;// destroyed before any early return below -> no leak on the Cancel path
-                emit isInPause(false);
+                emit isInPause(enginePaused);
                 ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"close dialog: "+std::to_string(newAction));
                 if(newAction==FileExists_Cancel)
                 {
                     emit cancelAll();
                     return;
                 }
-                if(dialogAlways && newAction!=alwaysDoThisActionForFileExists)
-                {
-                    alwaysDoThisActionForFileExists=newAction;
-                    listThread->setAlwaysFileExistsAction(alwaysDoThisActionForFileExists);
-                    if(uiIsInstalled)
-                        switch(newAction)
-                        {
-                            default:
-                            case FileExists_Skip:
-                                ui->comboBoxFileCollision->setCurrentIndex(1);
-                            break;
-                            case FileExists_Rename:
-                                ui->comboBoxFileCollision->setCurrentIndex(6);
-                            break;
-                        }
-                }
+                if(dialogAlways)
+                    alwaysDoThisActionForFileIsSame=newAction;
                 if(dialogAlways || newAction!=FileExists_Rename)
                     thread->setFileExistsAction(newAction);
                 else
@@ -159,7 +150,7 @@ void CopyEngine::fileAlreadyExists(INTERNALTYPEPATH source,INTERNALTYPEPATH dest
                 const bool dialogAlways=dialog->getAlways();
                 const std::string dialogNewName=dialog->getNewName();
                 delete dialog;// destroyed before any early return below -> no leak on the Cancel path
-                emit isInPause(false);
+                emit isInPause(enginePaused);
                 ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"close dialog: "+std::to_string(newAction));
                 if(newAction==FileExists_Cancel)
                 {
@@ -187,7 +178,7 @@ void CopyEngine::fileAlreadyExists(INTERNALTYPEPATH source,INTERNALTYPEPATH dest
                                 ui->comboBoxFileCollision->setCurrentIndex(2);
                             break;
                             case FileExists_OverwriteIfNotSameMdate:
-                                ui->comboBoxFileCollision->setCurrentIndex(3);
+                                ui->comboBoxFileCollision->setCurrentIndex(8);
                             break;
                             case FileExists_OverwriteIfNewer:
                                 ui->comboBoxFileCollision->setCurrentIndex(4);
@@ -199,7 +190,7 @@ void CopyEngine::fileAlreadyExists(INTERNALTYPEPATH source,INTERNALTYPEPATH dest
                                 ui->comboBoxFileCollision->setCurrentIndex(7);
                             break;
                             case FileExists_OverwriteIfNotSameSizeAndDate:
-                                ui->comboBoxFileCollision->setCurrentIndex(8);
+                                ui->comboBoxFileCollision->setCurrentIndex(3);
                             break;
                         }
                 }
@@ -249,12 +240,12 @@ void CopyEngine::missingDiskSpace(std::vector<Diskspace> list)
     dialog->exec();/// \bug crash when external close
     const bool ok=dialog->getAction();
     delete dialog;
-    emit isInPause(false);
+    emit isInPause(enginePaused);
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"cancel: "+std::to_string(ok));
     if(!ok)
         emit cancelAll();
     else
-        listThread->autoStartIfNeeded();
+        emit signal_autoStartIfNeeded();// on the list thread: it walks the scheduler's lists
 }
 
 /// \note Can be call without queue because all call will be serialized
@@ -369,14 +360,14 @@ void CopyEngine::errorOnFile(INTERNALTYPEPATH fileInfo, std::string errorString,
             const FileErrorAction newAction=dialog->getAction();
             const bool dialogAlways=dialog->getAlways();
             delete dialog;// destroyed before any early return below -> no leak on the Cancel path
-            emit isInPause(false);
+            emit isInPause(enginePaused);
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"close dialog: "+std::to_string(newAction));
             if(newAction==FileError_Cancel)
             {
                 emit cancelAll();
                 return;
             }
-            if(dialogAlways && newAction!=alwaysDoThisActionForFileError)
+            if(dialogAlways && newAction!=FileError_Retry && newAction!=alwaysDoThisActionForFileError)
             {
                 alwaysDoThisActionForFileError=newAction;
                 if(uiIsInstalled)
@@ -571,7 +562,8 @@ void CopyEngine::errorOnFolder(INTERNALTYPEPATH fileInfo, std::string errorStrin
                 emit cancelAll();
                 return;
             }
-            if(dialogAlways && newAction!=alwaysDoThisActionForFileError)
+            // "always" + Retry would retry a permanent error forever with no dialog: Retry stays one-shot
+            if(dialogAlways && newAction!=FileError_Retry && newAction!=alwaysDoThisActionForFolderError)
             {
                 setComboBoxFolderError(newAction);
                 alwaysDoThisActionForFolderError=newAction;
@@ -672,7 +664,8 @@ void CopyEngine::mkPathErrorOnFolder(INTERNALTYPEPATH folder, std::string errorS
                 emit cancelAll();
                 return;
             }
-            if(dialogAlways && newAction!=alwaysDoThisActionForFileError)
+            // "always" + Retry would retry a permanent error forever with no dialog: Retry stays one-shot
+            if(dialogAlways && newAction!=FileError_Retry && newAction!=alwaysDoThisActionForFolderError)
             {
                 setComboBoxFolderError(newAction);
                 alwaysDoThisActionForFolderError=newAction;

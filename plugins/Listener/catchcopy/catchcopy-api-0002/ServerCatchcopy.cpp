@@ -471,6 +471,14 @@ void ServerCatchcopy::connectionError(const QLocalSocket::LocalSocketError &erro
     }
 }
 
+int ServerCatchcopy::indexOfClient(const uint32_t id) const
+{
+    for(int index=0;index<clientList.size();index++)
+        if(clientList.at(index).id==id)
+            return index;
+    return -1;
+}
+
 void ServerCatchcopy::disconnected()
 {
     QLocalSocket *socket=qobject_cast<QLocalSocket *>(QObject::sender());
@@ -597,13 +605,19 @@ void ServerCatchcopy::readyRead()
                         return;
                     }
                     clientList[index].queryNoReplied << orderId;
+                    const uint32_t clientId=clientList.at(index).id;
                     if(!clientList.at(index).firstProtocolReplied && returnList.size()==2 && returnList.front()=="protocol")
                     {
                         clientList[index].firstProtocolReplied=true;
-                        protocolSupported(clientList.at(index).id,orderId,(returnList.back()==CATCHCOPY_PROTOCOL_VERSION));
+                        protocolSupported(clientId,orderId,(returnList.back()==CATCHCOPY_PROTOCOL_VERSION));
                     }
                     else
-                        parseInput(clientList.at(index).id,orderId,returnList);
+                        parseInput(clientId,orderId,returnList);
+                    // the order can run a modal (destination chooser, group question) in a nested event
+                    // loop: the client may have disconnected meanwhile (entry removed, socket deleted)
+                    index=indexOfClient(clientId);
+                    if(index==-1)
+                        return;
                 }
             }
             if(clientList.at(index).haveData)

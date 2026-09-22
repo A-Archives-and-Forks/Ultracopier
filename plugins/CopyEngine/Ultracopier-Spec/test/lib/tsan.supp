@@ -9,6 +9,11 @@
 # ("#0 write <libtsan> #1 <libglib> ..."). Classic false positive; every Qt-on-glib app hits
 # it. Suppressing by CALLING LIBRARY keeps any our-code-vs-our-code race fully reported.
 called_from_lib:libglib-2.0.so
-# Qt event-dispatcher internals on top of that same glib wakeup (QEventDispatcherGlib posting
-# across threads); pure libQt6Core-internal accesses -- our frames never appear in these.
+# Qt is not TSan-instrumented: its futex-based QMutex/QSemaphore/QThread::wait() and the queued
+# signal handoff (postEvent) give TSan no happens-before edge, so every Qt-mediated sync looks
+# like a race. CAVEAT (measured 2026-09-21): 'race:' matches ANY frame of either stack and every
+# QThread bottoms out in QThreadPrivate::start (libQt6Core), so this rule hides ALL races that
+# involve a Qt thread -- our own included (83 reports -> 0 on a plain copy). The lane still
+# catches crashes/deadlocks; for a real race audit run the driver with this line removed and
+# triage by hand (teardown-after-wait and queued-handoff pairs are the false-positive classes).
 race:libQt6Core.so.6

@@ -31,6 +31,8 @@ CopyEngineFactory::CopyEngineFactory() :
 {
     qRegisterMetaType<FolderExistsAction>("FolderExistsAction");
     qRegisterMetaType<FileExistsAction>("FileExistsAction");
+    qRegisterMetaType<std::string>("std::string");//newCopySend/newMoveSend (blocking queued) must not rely on the host app
+    qRegisterMetaType<std::vector<std::string> >("std::vector<std::string>");
     qRegisterMetaType<std::vector<Filters_rules> >("std::vector<Filters_rules>");
     qRegisterMetaType<TransferStat>("TransferStat");
     qRegisterMetaType<ActionType>("ActionType");
@@ -621,6 +623,8 @@ void CopyEngineFactory::setFileCollision(int index)
         case 4:
         case 5:
         case 6:
+        case 7:
+        case 8:
             optionsEngine->setOptionValue("fileCollision",std::to_string(index));
         break;
         default:

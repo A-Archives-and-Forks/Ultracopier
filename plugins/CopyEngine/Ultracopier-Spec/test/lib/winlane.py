@@ -668,7 +668,12 @@ def _scan_crashes(box: _Box, start_iso: str | None):
         "Write-Output ('CRASHES='+$n+';DETAIL='+$m) }}"
         "else{{ Write-Output 'CRASHES=0' }}"
     ).replace("{{", "{").replace("}}", "}")
-    r = box.ps(script, timeout=60)
+    try:
+        r = box.ps(script, timeout=60)
+    except subprocess.TimeoutExpired:
+        # a busy box can stall the event-log service well past 60 s (seen 2026-09-21): one retry
+        # with more room; a second timeout stays loud (the sub-case is reported as EXC)
+        r = box.ps(script, timeout=180)
     kv = _parse_kv(r.stdout)
     try:
         n = int(kv.get("CRASHES", "0"))

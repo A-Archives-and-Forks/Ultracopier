@@ -14,7 +14,6 @@
     #endif
     #include <windows.h>
 #endif
-#include <QMessageBox>
 
 std::string LogThread::text_header_copy="[Copy] ";
 std::string LogThread::text_header_move="[Move] ";
@@ -61,7 +60,9 @@ LogThread::LogThread()
     newOptionValue("Write_log",	"error_format",		OptionEngine::optionEngine->getOptionValue("Write_log","error_format"));
     newOptionValue("Write_log",	"folder_format",	OptionEngine::optionEngine->getOptionValue("Write_log","folder_format"));
     newOptionValue("Write_log",	"sync",				OptionEngine::optionEngine->getOptionValue("Write_log","sync"));
-    newOptionValue("Write_log",	"enabled",			OptionEngine::optionEngine->getOptionValue("Write_log","enabled"));
+    enabled=stringtobool(OptionEngine::optionEngine->getOptionValue("Write_log","enabled"));
+    if(enabled)//opened on the log thread once Core is connected to errorMessage(), not synchronously in this ctor
+        QMetaObject::invokeMethod(this,"openLogs",Qt::QueuedConnection);
     #ifdef Q_OS_WIN32
     DWORD size=0;
     WCHAR * computerNameW=new WCHAR[size];
@@ -104,7 +105,7 @@ void LogThread::openLogs()
         return;
     if(log.isOpen())
     {
-        QMessageBox::critical(NULL,tr("Error"),tr("Log file already open, error: %1").arg(log.errorString()));
+        emit errorMessage(tr("Log file already open, error: %1").arg(log.errorString()));
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"log file already open, error: "+log.errorString().toStdString());
         return;
     }
@@ -113,7 +114,7 @@ void LogThread::openLogs()
     {
         if(!log.open(QIODevice::WriteOnly|QIODevice::Unbuffered))
         {
-            QMessageBox::critical(NULL,tr("Error"),tr("Unable to open the log file, error: %1").arg(log.errorString()));
+            emit errorMessage(tr("Unable to open the log file, error: %1").arg(log.errorString()));
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Unable to open the log file, error: "+log.errorString().toStdString());
         }
         else
@@ -123,7 +124,7 @@ void LogThread::openLogs()
     {
         if(!log.open(QIODevice::WriteOnly))
         {
-            QMessageBox::critical(NULL,tr("Error"),tr("Unable to open the log file, error: %1").arg(log.errorString()));
+            emit errorMessage(tr("Unable to open the log file, error: %1").arg(log.errorString()));
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Unable to open the log file, error: "+log.errorString().toStdString());
         }
         else
@@ -187,7 +188,7 @@ void LogThread::newTransferStop(const Ultracopier::ItemOfCopyList &item)
 
 void LogThread::error(const std::string &path,const uint64_t &size,const uint64_t &mtime,const std::string &error)
 {
-    if(!log_enable_error)
+    if(!enabled || !log_enable_error)
         return;
     std::string text=LogThread::text_header_error+error_format+lineReturn;
     text=replaceBaseVar(text);
@@ -252,11 +253,11 @@ void LogThread::newOptionValue(const std::string &group,const std::string &name,
         }
     }
     else if(name=="transfer")
-        log_enable_transfer=stringtobool(OptionEngine::optionEngine->getOptionValue("Write_log","enabled")) && stringtobool(value);
+        log_enable_transfer=stringtobool(value);
     else if(name=="error")
-        log_enable_error=stringtobool(OptionEngine::optionEngine->getOptionValue("Write_log","enabled")) && stringtobool(value);
+        log_enable_error=stringtobool(value);
     else if(name=="folder")
-        log_enable_folder=stringtobool(OptionEngine::optionEngine->getOptionValue("Write_log","enabled")) && stringtobool(value);
+        log_enable_folder=stringtobool(value);
     if(name=="enabled")
     {
         enabled=stringtobool(value);

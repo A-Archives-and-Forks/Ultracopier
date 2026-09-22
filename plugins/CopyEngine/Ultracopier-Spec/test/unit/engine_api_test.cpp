@@ -4,11 +4,20 @@
 // API on the running transfer:
 //   * plain copy  -> completes (actionInProgess Idle after active) and content is byte-correct.
 //   * pause/resume -> realByteTransfered() HALTS while paused, then completes correctly on resume.
+//   * puttoend     -> ONE inode thread + fileError=put-to-end: a file whose first read fails (shim
+//                    flaky:<name>:1) is deferred to the end and copied on its one retry; the job
+//                    reaches Idle with every file byte-identical. This is the put-to-end close
+//                    handshake (WriteThread::stop(false) -> closed() -> putAtBottomAfterError) on the
+//                    single thread that also copies everything else -- under TSan it is the only
+//                    stable way to watch that handshake (the full app dies on the Qt registry CHECK).
+//   * cancel       -> cancel() mid-transfer reaches canBeDeleted() (every transfer thread went Idle)
+//                    and the partial destination is removed. A 3.1 regression left the engine
+//                    waiting forever (leaked engine + threads, partial file kept).
 //
 // I/O is slowed by the LD_PRELOAD shim (UC_FS_SCENARIO=slow:<ms>) so the copy is long enough to
 // catch it mid-flight and pause it. Async backend only (libc I/O; io_uring bypasses libc).
 //
-// argv: <src> <dest> [pause]
+// argv: <src> <dest> [pause|cancel|puttoend]
 #include "CopyEngine.h"
 #include "../../../interface/FacilityInterface.h"
 #include "../../../interface/PluginInterface_CopyEngine.h"
@@ -16,6 +25,7 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -53,13 +63,13 @@ public:
     void *prepareOpusAudio(const std::string &, QBuffer &) const override { return nullptr; }
 };
 
-static void configure(CopyEngine &e) {
+static void configure(CopyEngine &e, int inodeThreads) {
     e.setAutoStart(true);
     e.setFileCollision(2);    // Overwrite
     e.setFolderCollision(1);  // Merge
     e.setFileError(1);        // Skip
     e.setFolderError(1);      // Skip
-    e.setInodeThreads(16);
+    e.setInodeThreads(inodeThreads);
     e.setParallelizeIfSmallerThan(128);
     e.setCoalesceSourceStat(true);
     e.setRightTransfer(false);
@@ -68,7 +78,7 @@ static void configure(CopyEngine &e) {
     e.setCheckDestinationFolderExists(false);
     e.setMoveTheWholeFolder(false);
     e.setFollowTheStrictOrder(false);
-    e.setDeletePartiallyTransferredFiles(false);
+    e.setDeletePartiallyTransferredFiles(std::getenv("UC_TEST_KEEP_PARTIALS") == nullptr);   // shipping default: delete
     e.setRenameTheOriginalDestination(false);
     e.setChecksum(false);
     e.setCheckDiskSpace(false);
@@ -79,14 +89,21 @@ static void configure(CopyEngine &e) {
 
 int main(int argc, char **argv) {
     QApplication app(argc, argv);   // run under the offscreen QPA (set via env)
-    if (argc < 3) { std::fprintf(stderr, "usage: <src> <dest> [pause]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: <src> <dest> [pause|cancel]\n"); return 2; }
     const std::string src = argv[1], dest = argv[2];
     const bool doPause = (argc > 3 && std::string(argv[3]) == "pause");
+    const bool doCancel = (argc > 3 && std::string(argv[3]) == "cancel");
+    const bool doPutToEnd = (argc > 3 && std::string(argv[3]) == "puttoend");
 
     StubFacility facility;
     CopyEngine engine(&facility);
     engine.connectTheSignalsSlots();
-    configure(engine);
+    // put-to-end: ONE inode thread from the start (the deferred file comes back to the same thread);
+    // sizing to 16 then shrinking would tear 15 threads down right before the scan thread starts,
+    // which trips libtsan's thread-registry CHECK on pthread_t reuse (Qt detached threads)
+    configure(engine, doPutToEnd ? 1 : 16);
+    if (doPutToEnd)
+        engine.setFileError(2);      // put to the end of the list (one deferred retry)
 
     bool sawActive = false, done = false, canDelete = false;
     QObject::connect(&engine, &PluginInterface_CopyEngine::actionInProgess,
@@ -105,10 +122,20 @@ int main(int argc, char **argv) {
     engine.newCopy(std::vector<std::string>{src}, dest);
 
     QElapsedTimer t; t.start();
-    bool paused = false, pauseReported = false;
-    while (!done && !canDelete && t.elapsed() < 120000) {
+    bool paused = false, pauseReported = false, cancelled = false;
+    qint64 cancelAt = 0;
+    // after a cancel only canBeDeleted() ends the wait (Idle alone is not the engine's teardown signal)
+    while (!(done && !doCancel) && !canDelete && t.elapsed() < 120000) {
         app.processEvents(QEventLoop::AllEvents, 30);
         const uintmax_t d = treeBytes(dest);
+        if (doCancel && !cancelled && sawActive && d > srcTotal / 10 && d < (srcTotal * 7) / 10) {
+            engine.cancel(); cancelled = true; cancelAt = t.elapsed();
+            std::printf("CANCEL at destBytes=%llu/%llu\n", (unsigned long long)d, (unsigned long long)srcTotal);
+        }
+        if (cancelled && t.elapsed() - cancelAt > 20000) {
+            std::printf("CANCEL-TIMEOUT canBeDeleted never came in 20s\n");
+            break;
+        }
         // Pause mid-stream: some bytes written, but not yet all (catch it in flight).
         if (doPause && !paused && sawActive && d > srcTotal / 10 && d < (srcTotal * 7) / 10) {
             engine.pause(); paused = true;
@@ -127,8 +154,11 @@ int main(int argc, char **argv) {
             engine.resume();
         }
     }
-    std::printf("DONE done=%d canDelete=%d destBytes=%llu/%llu paused=%d\n",
+    std::printf("DONE done=%d canDelete=%d destBytes=%llu/%llu paused=%d cancelled=%d\n",
                 done ? 1 : 0, canDelete ? 1 : 0,
-                (unsigned long long)treeBytes(dest), (unsigned long long)srcTotal, paused ? 1 : 0);
+                (unsigned long long)treeBytes(dest), (unsigned long long)srcTotal, paused ? 1 : 0,
+                cancelled ? 1 : 0);
+    if (doCancel)
+        return canDelete ? 0 : 1;
     return (done || canDelete) ? 0 : 1;
 }

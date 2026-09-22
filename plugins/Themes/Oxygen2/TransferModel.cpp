@@ -1,6 +1,8 @@
 #include "TransferModel.h"
 #include "../../../cpp11addition.h"
 #include <iostream>
+#include <algorithm>
+#include <unordered_set>
 
 #define COLUMN_COUNT 3
 
@@ -350,6 +352,23 @@ std::vector<uint64_t> TransferModel::synchronizeItems(const std::vector<Ultracop
     index_for_loop=0;
     quint64 totalFile=0,totalSize=0,currentFile=0;
     emit layoutAboutToBeChanged();
+    /* Removals are by ID, deferred and applied in one compaction pass (same as the Oxygen theme).
+       The engine's RemoveItem position is a PHYSICAL slot of its tombstoned list, not a row of
+       this dense model: erasing by position removed the WRONG row (a still-pending file) and left
+       the finished one displayed forever, so the list never emptied and the window never closed. */
+    std::unordered_set<uint64_t> idsToRemove;
+    auto applyPendingRemovals=[&](){
+        if(!idsToRemove.empty())
+        {
+            transfertItemList.erase(
+                std::remove_if(transfertItemList.begin(),transfertItemList.end(),
+                    [&idsToRemove](const std::unique_ptr<TransfertItem> &it){
+                        return idsToRemove.find(it->id)!=idsToRemove.cend();
+                    }),
+                transfertItemList.end());
+            idsToRemove.clear();
+        }
+    };
     while(index_for_loop<loop_size)
     {
         const Ultracopier::ReturnActionOnCopyList& action=returnActions.at(index_for_loop);
@@ -371,6 +390,8 @@ std::vector<uint64_t> TransferModel::synchronizeItems(const std::vector<Ultracop
             break;
             case Ultracopier::MoveItem:
             {
+                // positions in MoveItem are relative to the list with prior removals applied
+                applyPendingRemovals();
                 //bool current_entry=
                 if(action.userAction.position<0)
                 {
@@ -407,17 +428,7 @@ std::vector<uint64_t> TransferModel::synchronizeItems(const std::vector<Ultracop
             {
                 if(currentIndexSearch>0 && action.userAction.position<=currentIndexSearch)
                     currentIndexSearch--;
-                if(action.userAction.position<0)
-                {
-                    ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,QStringLiteral("id: %1, position is wrong: %3").arg(action.addAction.id).arg(action.userAction.position).toStdString());
-                    break;
-                }
-                if((unsigned int)action.userAction.position>(transfertItemList.size()-1))
-                {
-                    ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,QStringLiteral("id: %1, position is wrong: %3").arg(action.addAction.id).arg(action.userAction.position).toStdString());
-                    break;
-                }
-                transfertItemList.erase(transfertItemList.cbegin()+action.userAction.position);
+                idsToRemove.insert(action.addAction.id);
                 currentFile++;
                 startId.erase(action.addAction.id);
                 stopId.erase(action.addAction.id);
@@ -489,6 +500,7 @@ std::vector<uint64_t> TransferModel::synchronizeItems(const std::vector<Ultracop
         }
         index_for_loop++;
     }
+    applyPendingRemovals();
 
     if(!oldIndexes.isEmpty())
     {

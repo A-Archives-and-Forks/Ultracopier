@@ -25,6 +25,7 @@
 TransferThreadUring::TransferThreadUring()
 {
     ringInitialized=false;
+    fileGeneration=0;
     sourceFd=-1;
     destFd=-1;
     sourceFileSize=0;
@@ -65,6 +66,9 @@ TransferThreadUring::~TransferThreadUring()
     // op (unlike Win32 CloseHandle) does NOT cancel pending ops — i.e. a kernel use-after-free
     // of a just-freed buffer. After wait() the ring is gone, so this is safe.
     freePipelineBuffers();
+    for(char *p : orphanedBuffers)
+        free(p);
+    orphanedBuffers.clear();
 }
 
 void TransferThreadUring::run()
@@ -328,7 +332,10 @@ int TransferThreadUring::openDestFile(uint64_t startSize)
     //     before this an overwrite onto a LONGER pre-existing file kept a stale tail (a real io_uring
     //     overwrite bug; copy_override/move_override exposed it once stale test binaries were rebuilt).
     //   startSize>0 -> keep the prefix [0,startSize), trim any out-of-order tail above it (resume).
-    if(ftruncate(fd,startSize)!=0)
+    // ...except a user's PRE-EXISTING destination on a fresh overwrite (async parity, guard #9): it is cut to
+    // the new size only once the copy SUCCEEDED (end of doTransferPipeline), so a source that turns out
+    // unreadable at byte 0 leaves the old file untouched instead of a 0-byte wreck.
+    if(!(startSize==0 && destinationPreExisted) && ftruncate(fd,startSize)!=0)
     {
         int t=errno;
         errorString_internal=strerror(t);
@@ -462,6 +469,7 @@ void TransferThreadUring::doTransferPipeline()
     int writesInFlight=0;
     bool readDone=false;
     bool errorOccurred=false;
+    fileGeneration++;// every read/write of THIS file carries it; a late CQE of an older file is dropped
 
     // Submit initial batch of reads
     {
@@ -487,7 +495,7 @@ void TransferThreadUring::doTransferPipeline()
             pipelineBuffers[i].chunkSize=toRead;
             pipelineBuffers[i].bytesUsed=0;
             io_uring_prep_read(sqe,sourceFd,pipelineBuffers[i].data,toRead,readOffset);
-            io_uring_sqe_set_data64(sqe,OP_READ_TAG|(uint64_t)i);
+            io_uring_sqe_set_data64(sqe,dataTag(OP_READ_TAG,i));
             pipelineBuffers[i].state=PipelineBuffer::Reading;
             readOffset+=toRead;
             readsInFlight++;
@@ -551,8 +559,12 @@ void TransferThreadUring::doTransferPipeline()
             if(userData==LIBURING_UDATA_TIMEOUT)
                 continue;
             uint64_t opType=userData&OP_MASK;
-            int bufIdx=(int)(userData&IDX_MASK);
+            int bufIdx=(int)(userData&BUF_MASK);
             int result=cqe->res;
+            if(opType!=OP_READ_TAG && opType!=OP_WRITE_TAG)
+                continue;// swept close/cancel completions of an earlier file: not ours to account
+            if(((userData>>GEN_SHIFT)&0xFF)!=fileGeneration)
+                continue;// a late completion of a PREVIOUS file's orphaned op: its buffer is quarantined
 
             if(opType==OP_READ_TAG)
             {
@@ -568,9 +580,29 @@ void TransferThreadUring::doTransferPipeline()
                 }
                 if(result==0)
                 {
-                    // EOF
-                    pipelineBuffers[bufIdx].state=PipelineBuffer::Free;
+                    // EOF before the chunk was full: the source SHRANK since the scan. The bytes already
+                    // in the buffer are still written (the end-of-copy size check then reports the change).
                     readDone=true;
+                    if(pipelineBuffers[bufIdx].bytesUsed>0)
+                    {
+                        struct io_uring_sqe *sqe=io_uring_get_sqe(&ring);
+                        if(!sqe)
+                        {
+                            errorString_internal="io_uring_get_sqe failed for write";
+                            errorOccurred=true;
+                            writeError=true;
+                            emit errorOnFile(destination,errorString_internal);
+                            break;
+                        }
+                        pipelineBuffers[bufIdx].state=PipelineBuffer::Writing;
+                        io_uring_prep_write(sqe,destFd,pipelineBuffers[bufIdx].data,
+                                            pipelineBuffers[bufIdx].bytesUsed,pipelineBuffers[bufIdx].fileOffset);
+                        io_uring_sqe_set_data64(sqe,dataTag(OP_WRITE_TAG,bufIdx));
+                        writesInFlight++;
+                        needSubmit=true;
+                    }
+                    else
+                        pipelineBuffers[bufIdx].state=PipelineBuffer::Free;
                 }
                 else
                 {
@@ -594,7 +626,7 @@ void TransferThreadUring::doTransferPipeline()
                                            pipelineBuffers[bufIdx].data+pipelineBuffers[bufIdx].bytesUsed,
                                            rem,
                                            pipelineBuffers[bufIdx].fileOffset+pipelineBuffers[bufIdx].bytesUsed);
-                        io_uring_sqe_set_data64(sqe,OP_READ_TAG|(uint64_t)bufIdx);
+                        io_uring_sqe_set_data64(sqe,dataTag(OP_READ_TAG,bufIdx));
                         pipelineBuffers[bufIdx].state=PipelineBuffer::Reading;
                         readsInFlight++;
                     }
@@ -606,7 +638,7 @@ void TransferThreadUring::doTransferPipeline()
                         pipelineBuffers[bufIdx].state=PipelineBuffer::Writing;
                         io_uring_prep_write(sqe,destFd,pipelineBuffers[bufIdx].data,
                                             pipelineBuffers[bufIdx].bytesUsed,pipelineBuffers[bufIdx].fileOffset);
-                        io_uring_sqe_set_data64(sqe,OP_WRITE_TAG|(uint64_t)bufIdx);
+                        io_uring_sqe_set_data64(sqe,dataTag(OP_WRITE_TAG,bufIdx));
                         writesInFlight++;
                     }
                     needSubmit=true;
@@ -648,7 +680,7 @@ void TransferThreadUring::doTransferPipeline()
                         break;
                     }
                     io_uring_prep_write(sqe,destFd,pipelineBuffers[bufIdx].data,remaining,pipelineBuffers[bufIdx].fileOffset);
-                    io_uring_sqe_set_data64(sqe,OP_WRITE_TAG|(uint64_t)bufIdx);
+                    io_uring_sqe_set_data64(sqe,dataTag(OP_WRITE_TAG,bufIdx));
                     writesInFlight++;
                     needSubmit=true;
                     continue;
@@ -671,7 +703,7 @@ void TransferThreadUring::doTransferPipeline()
                         pipelineBuffers[bufIdx].chunkSize=toRead;
                         pipelineBuffers[bufIdx].bytesUsed=0;
                         io_uring_prep_read(sqe,sourceFd,pipelineBuffers[bufIdx].data,toRead,readOffset);
-                        io_uring_sqe_set_data64(sqe,OP_READ_TAG|(uint64_t)bufIdx);
+                        io_uring_sqe_set_data64(sqe,dataTag(OP_READ_TAG,bufIdx));
                         pipelineBuffers[bufIdx].state=PipelineBuffer::Reading;
                         readOffset+=toRead;
                         readsInFlight++;
@@ -693,6 +725,63 @@ void TransferThreadUring::doTransferPipeline()
             io_uring_submit(&ring);
     }
 
+    // On stop/error reads/writes may still be owned by the kernel. They MUST be accounted for before this
+    // returns: the buffers are reused by the NEXT file, and io_uring's close does NOT cancel pending ops --
+    // a late read would land OLD bytes into the next file's buffer (and its CQE be credited to it), a late
+    // write keep writing from a recycled buffer. Cancel them, reap for a bounded time, then QUARANTINE
+    // whatever is still pending (dead sector, stalled network mount): its buffer is never reused nor freed
+    // before the worker dies, and its eventual CQE carries an older generation and is dropped above.
+    if(readsInFlight>0 || writesInFlight>0)
+    {
+        for(int i=0;i<NUM_BUFFERS;i++)
+            if(pipelineBuffers[i].state==PipelineBuffer::Reading || pipelineBuffers[i].state==PipelineBuffer::Writing)
+            {
+                struct io_uring_sqe *sqe=io_uring_get_sqe(&ring);
+                if(sqe)
+                {
+                    const uint64_t op=(pipelineBuffers[i].state==PipelineBuffer::Reading)?OP_READ_TAG:OP_WRITE_TAG;
+                    io_uring_prep_cancel64(sqe,dataTag(op,i),0);
+                    io_uring_sqe_set_data64(sqe,OP_CANCEL_TAG|(uint64_t)i);
+                }
+            }
+        io_uring_submit(&ring);
+        struct __kernel_timespec deadline;
+        deadline.tv_sec=2;
+        deadline.tv_nsec=0;
+        while(readsInFlight>0 || writesInFlight>0)
+        {
+            struct io_uring_cqe *cqe;
+            if(io_uring_wait_cqe_timeout(&ring,&cqe,&deadline)<0)
+                break;// -ETIME: genuinely wedged -> quarantine below
+            const uint64_t userData=io_uring_cqe_get_data64(cqe);
+            if(((userData>>GEN_SHIFT)&0xFF)==fileGeneration)
+            {
+                if((userData&OP_MASK)==OP_READ_TAG)
+                {
+                    readsInFlight--;
+                    pipelineBuffers[userData&BUF_MASK].state=PipelineBuffer::Free;
+                }
+                else if((userData&OP_MASK)==OP_WRITE_TAG)
+                {
+                    writesInFlight--;
+                    pipelineBuffers[userData&BUF_MASK].state=PipelineBuffer::Free;
+                }
+            }
+            io_uring_cqe_seen(&ring,cqe);
+        }
+        for(int i=0;i<NUM_BUFFERS;i++)
+            if(pipelineBuffers[i].state==PipelineBuffer::Reading || pipelineBuffers[i].state==PipelineBuffer::Writing)
+            {
+                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] I/O still pending after the cancel drain, buffer quarantined");
+                orphanedBuffers.push_back(pipelineBuffers[i].data);
+                pipelineBuffers[i].data=nullptr;// initPipelineBuffers() mallocs a fresh block next time
+                pipelineBuffers[i].allocSize=0;
+                pipelineBuffers[i].state=PipelineBuffer::Free;
+            }
+        readsInFlight=0;
+        writesInFlight=0;
+    }
+
     if(!errorOccurred && !stopIt)
     {
         /* No per-file fsync. A blocking fsync per file forced a disk-durability
@@ -702,14 +791,40 @@ void TransferThreadUring::doTransferPipeline()
            bandwidth. Neither rsync nor the async backend fsync each file: the
            written data stays in the page cache and the kernel flushes it
            normally. A file copy does not need per-file durability. */
-        transferProgression=sourceFileSize;
-        // Whole file is contiguously written: the resume water-mark equals the file size. (On the
-        // ERROR path we deliberately leave contiguousWrittenOffset at its true mid-file value so the
-        // resume decision in resumeAfterErrorAndSeek() reads the real safe offset.)
-        contiguousWrittenOffset=(uint64_t)sourceFileSize;
+        if(transferProgression!=sourceFileSize)
+        {
+            // fewer bytes than the size at open: the source SHRANK while it was read (async parity:
+            // "File truncated during the read"); never claim the file complete
+            errorString_internal=tr("File truncated during the read, possible data change").toStdString();
+            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] "+errorString_internal);
+            readError=true;
+            errorOccurred=true;
+            emit errorOnFile(source,errorString_internal);
+        }
+        // a pre-existing destination longer than the source keeps a stale tail: cut it, now that the whole
+        // new content is in place (the open deliberately did not truncate it, guard #9)
+        else if(destinationPreExisted && resumeFromOffset==0 && ftruncate(destFd,(off_t)sourceFileSize)!=0)
+        {
+            errorString_internal=strerror(errno);
+            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] Unable to truncate: "+errorString_internal);
+            writeError=true;
+            errorOccurred=true;
+            emit errorOnFile(destination,errorString_internal);
+        }
+        else
+            // Whole file is contiguously written: the resume water-mark equals the file size. (On the
+            // ERROR path we deliberately leave contiguousWrittenOffset at its true mid-file value so the
+            // resume decision in resumeAfterErrorAndSeek() reads the real safe offset.)
+            contiguousWrittenOffset=(uint64_t)sourceFileSize;
     }
 
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] doTransferPipeline end, transferred: "+std::to_string(transferProgression));
+}
+
+void TransferThreadUring::trimDestinationToContiguous()
+{
+    if(destFd>=0 && ftruncate(destFd,(off_t)contiguousWrittenOffset)!=0)
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to trim the partial destination: "+std::string(strerror(errno)));
 }
 bool TransferThreadUring::remainSourceOpen() const
 {

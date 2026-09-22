@@ -64,6 +64,8 @@ TransferThreadPipelined::TransferThreadPipelined() :
        semaphore (no resume() ever comes) -> the copy hung after a handful of files.
        Always start un-paused. */
     putInPause=false;
+    workerInsidePipeline=false;
+    stopFinalized=false;
 
     #ifdef ULTRACOPIER_PLUGIN_SPEED_SUPPORT
     multiForBigSpeed=0;
@@ -85,6 +87,8 @@ void TransferThreadPipelined::connectInternalSignals()
     // media-reconnect RESUME: the retry path emits internalStartResumeAfterErrorAndSeek instead of
     // restarting from 0 when a SOURCE read error MAY be resumable; the slot makes the size/mtime/ctime
     // decision on the transfer thread (queued), then re-opens via preOperation.
+    if(!connect(this,&TransferThreadPipelined::internalStartRetryAfterError,this,&TransferThreadPipelined::retryAfterErrorInternal,Qt::QueuedConnection))
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"unable to connect internalStartRetryAfterError()");
     if(!connect(this,&TransferThreadPipelined::internalStartResumeAfterErrorAndSeek,this,&TransferThreadPipelined::resumeAfterErrorAndSeek,Qt::QueuedConnection))
         abort();
     if(!connect(this,&TransferThread::internalStartPostOperation,this,&TransferThreadPipelined::postOperation,Qt::QueuedConnection))
@@ -278,8 +282,39 @@ bool TransferThreadPipelined::destinationIsOursToRemove() const
     return !destinationPreExisted;
 }
 
+void TransferThreadPipelined::finalizeStoppedTransfer()
+{
+    // a PURE fault skip (fileError=Skip after a read/write error) keeps the readable salvage, an EMPTY
+    // salvage is a phantom, everything else (cancel, put-to-end, clean skip) removes its partial --
+    // never a user's pre-existing destination, never the moved file of a successful rename
+    if(!realMove && !source.empty() && needRemove && deletePartiallyTransferredFiles && destinationIsOursToRemove()
+            && (!finalSkipNoRetry || !(readError||writeError) || TransferThread::file_stat_size(destination)<=0))
+        if(is_file(source) && source!=destination)
+            if(!unlink(destination))
+                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
+                                         "] unable to remove the partial destination: "+
+                                         TransferThread::internalStringTostring(destination));
+    source.clear();
+    destination.clear();
+    resetExtraVariable();
+    needRemove=false;
+    needSkip=false;
+    transfer_stat=TransferStat_Idle;
+    emit postOperationStopped();
+}
+
+void TransferThreadPipelined::finalizeIfStopRequested()
+{
+    if((stopIt || needSkip) && !stopFinalized.exchange(true))
+        finalizeStoppedTransfer();
+}
+
 void TransferThreadPipelined::postOperation()
 {
+    // queued from skip()'s "nothing open" branch, which then goes Idle at once: by the time this runs the
+    // thread may already carry the NEXT file -- never stamp the old date onto it
+    if(transfer_stat!=TransferStat_PostOperation)
+        return;
     doFilePostOperation();
 }
 
@@ -339,7 +374,7 @@ bool TransferThreadPipelined::tryNativeCopy()
         {
             // the user cancelled through pbCancel -> honour the stop, do NOT retry another way
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] native copy cancelled");
-            if(!source.empty() && destinationIsOursToRemove() && source!=destination)
+            if(!source.empty() && deletePartiallyTransferredFiles && destinationIsOursToRemove() && source!=destination)
                 if(!unlink(destination))
                     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to remove the cancelled native-copy destination");
             resetExtraVariable();
@@ -415,7 +450,7 @@ bool TransferThreadPipelined::tryNativeCopy()
                 // #9: on cancel, only remove the destination if it is OURS (never a user's pre-existing
                 // dest). Mirrors the skip-path guard. (NB: the native O_TRUNC above already destroyed a
                 // pre-existing dest -- the truncate-skip for the native path is separate follow-up work.)
-                if(stopIt && needRemove && destinationIsOursToRemove())
+                if(stopIt && needRemove && deletePartiallyTransferredFiles && destinationIsOursToRemove())
                     if(!unlink(destination))
                         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
                                                  "] unable to remove the partial destination: "+
@@ -435,10 +470,11 @@ bool TransferThreadPipelined::tryNativeCopy()
                 //EXDEV/ENOSYS/EINVAL: cross-device or unsupported -> fall back to the pipeline
                 if(terr==EXDEV || terr==ENOSYS || terr==EINVAL)
                 {
-                    if(!unlink(destination))
-                        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
-                                                 "] unable to remove the partial destination: "+
-                                                 TransferThread::internalStringTostring(destination));
+                    if(destinationIsOursToRemove())// nothing was copied yet: a user's pre-existing dest stays
+                        if(!unlink(destination))
+                            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
+                                                     "] unable to remove the partial destination: "+
+                                                     TransferThread::internalStringTostring(destination));
                     return false;
                 }
                 readError=false;
@@ -483,7 +519,7 @@ bool TransferThreadPipelined::tryNativeCopy()
     {
         if(stopIt)
         {
-            if(!source.empty() && destinationIsOursToRemove())   // #9: keep a user's pre-existing dest on cancel
+            if(!source.empty() && deletePartiallyTransferredFiles && destinationIsOursToRemove())   // #9: keep a user's pre-existing dest on cancel
                 if(exists(source) && source!=destination)
                     if(!unlink(destination))
                         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
@@ -558,23 +594,41 @@ void TransferThreadPipelined::ifCanStartTransfer()
 
     if(!realMove)
     {
+        // From here to the end of this branch the WORKER owns the file: a stop()/skip() that lands
+        // meanwhile only raises the flags, and the tail below (or finalizeIfStopRequested after a
+        // synchronous helper) publishes the one Idle + postOperationStopped.
+        stopFinalized.store(false);
+        workerInsidePipeline.store(true);
+
         // Symlink handling is backend-specific: the POSIX backend recreates the link,
         // the Windows backend follows it and copies the target. The hook returns true
         // when it fully handled a symlinked source (success or error already emitted);
         // false means "not a symlink / follow semantics" -> do the normal pipelined
         // copy below through the backend I/O hooks.
         if(trySymlinkCopy())
+        {
+            workerInsidePipeline.store(false);
+            if(transfer_stat!=TransferStat_Idle)// error-wait: a stop raised meanwhile is ours to finish
+                finalizeIfStopRequested();
             return;
+        }
 
         // native_copy option (CopyFileExW / copy_file_range); falls through to the
         // pipeline below when the option is off or the OS path is unsupported.
         if(tryNativeCopy())
+        {
+            workerInsidePipeline.store(false);
+            if(transfer_stat!=TransferStat_Idle)
+                finalizeIfStopRequested();
             return;
+        }
 
         if(openSourceFile()<0)
         {
             readError=true;
             emit errorOnFile(source,errorString_internal);
+            workerInsidePipeline.store(false);
+            finalizeIfStopRequested();
             return;
         }
         readIsOpenVariable=true;
@@ -586,11 +640,13 @@ void TransferThreadPipelined::ifCanStartTransfer()
         const int destRet=openDestFile(resumeFromOffset);
         if(destRet<0)
         {
+            workerInsidePipeline.store(false);
             if(destRet==-2) // collision, not an error
                 return;
             writeError=true;
             closeFiles(); // closes the already-open source handle/fd
             emit errorOnFile(destination,errorString_internal);
+            finalizeIfStopRequested();
             return;
         }
         writeIsOpenVariable=true;
@@ -623,6 +679,11 @@ void TransferThreadPipelined::ifCanStartTransfer()
             if(applyDateTimeOnOpenDestination())
                 dateAppliedOnOpenHandle=true;
 
+        // a partial we may KEEP (fault-skip salvage, resume prefix) must be a faithful prefix: the
+        // out-of-order writes can have landed bytes above a hole
+        if((readError || writeError || stopIt || needSkip) && destinationIsOursToRemove())
+            trimDestinationToContiguous();
+
         // Close files
         closeFiles();
         readIsClosedVariable=true;
@@ -634,20 +695,19 @@ void TransferThreadPipelined::ifCanStartTransfer()
         {
             emit readStopped();
             checkIfAllIsClosedAndDoOperations();
+            workerInsidePipeline.store(false);
             return;
         }
-        else if(stopIt)
+        workerInsidePipeline.store(false);
+        if(stopIt)
         {
-            // Cleanup on stop
-            if(!source.empty() && needRemove && destinationIsOursToRemove())   // #9: keep a user's pre-existing dest on cancel
-                if(exists(source) && source!=destination)
-                    if(!unlink(destination))
-                        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
-                                                 "] unable to remove the partial destination: "+
-                                                 TransferThread::internalStringTostring(destination));
+            if(!stopFinalized.exchange(true))
+                finalizeStoppedTransfer();
             return;
         }
-        // Error case: error already emitted
+        // Error case: error already emitted, the error policy decides next; a stop/skip that landed while
+        // we were still copying is ours to finish
+        finalizeIfStopRequested();
         return;
     }
 
@@ -660,7 +720,7 @@ void TransferThreadPipelined::ifCanStartTransfer()
                                  " "+strError+"("+std::to_string(terr)+")");
         if(stopIt)
         {
-            if(!source.empty() && destinationIsOursToRemove())   // #9: keep a user's pre-existing dest on cancel
+            if(!source.empty() && deletePartiallyTransferredFiles && destinationIsOursToRemove())   // #9: keep a user's pre-existing dest on cancel
                 if(exists(source) && source!=destination)
                     if(!unlink(destination))
                         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
@@ -672,7 +732,10 @@ void TransferThreadPipelined::ifCanStartTransfer()
         if(readError)
             emit errorOnFile(source,strError);
         else
+        {
+            writeError=true;// the failed rename is a destination-side error: stop() needs a flag to reach Idle
             emit errorOnFile(destination,strError);
+        }
     }
 }
 
@@ -837,7 +900,7 @@ void TransferThreadPipelined::checkIfAllIsClosedAndDoOperations()
     // #9 source-vanish guard: only remove the destination if it is OURS (we created it / it was empty).
     // A user's PRE-EXISTING non-empty dest (an OVERWRITE whose source vanished before the first byte)
     // must NOT be deleted -- cp/rsync leave it untouched. (iouring_source_vanish)
-    if(!source.empty() && needRemove && (stopIt || needSkip) && destinationIsOursToRemove())
+    if(!source.empty() && needRemove && deletePartiallyTransferredFiles && (stopIt || needSkip) && destinationIsOursToRemove())
         if(is_file(source) && source!=destination)
             if(!unlink(destination))
                 ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
@@ -931,8 +994,10 @@ void TransferThreadPipelined::stop()
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] transfer_stat==TransferStat_Idle");
         return;
     }
-    if(transfer_stat==TransferStat_PreOperation)
+    if(transfer_stat==TransferStat_PreOperation || transfer_stat==TransferStat_WaitForTheTransfer)
     {
+        // nothing is open yet (the wait for the large-transfer slot included): no completion will ever
+        // come, so go Idle here or the cancel never completes (checkIfReadyToCancel waits for Idle)
         transfer_stat=TransferStat_Idle;
         return;
     }
@@ -942,11 +1007,18 @@ void TransferThreadPipelined::stop()
             transfer_stat=TransferStat_Idle;
         return;
     }
+    if(transfer_stat!=TransferStat_Transfer)
+        return;// PostTransfer/Checksum/PostOperation: the worker is inside its own completion tail, it reaches Idle
     pauseMutex.release();
     // The worker is BLOCKED in doTransferPipeline()'s completion wait. Interrupt it so it notices stopIt
     // and closes its OWN handles/fds (default = closeFiles() here; IOCP polls stopIt itself and overrides
     // this to a no-op to avoid the cross-thread CloseHandle race -- see interruptTransferForStop()).
     interruptTransferForStop();
+    if(workerInsidePipeline.load())
+        return;// the worker's tail finalizes
+    // error-wait: the worker already closed everything and sits idle until the policy decides -> finish here
+    if(!stopFinalized.exchange(true))
+        finalizeStoppedTransfer();
 }
 
 void TransferThreadPipelined::skip()
@@ -999,30 +1071,22 @@ void TransferThreadPipelined::skip()
         pauseMutex.release();
         // Interrupt the blocked worker (default closeFiles(); IOCP no-op + self-poll -- see stop()).
         interruptTransferForStop();
-        // #9 source-vanish guard (mirrors line ~778): on a skip, only remove the destination if it is
-        // OURS. A user's pre-existing non-empty dest (an OVERWRITE whose source vanished before the first
-        // byte -- exists(source) is a stat that still succeeds) must NOT be deleted. (iouring_source_vanish)
-        // NB when the worker self-closes (IOCP), the dest handle may still be OPEN here so this DeleteFile
-        // can fail with a sharing violation; that is harmless -- the worker's own stop-cleanup
-        // (ifCanStartTransfer, "stopIt" branch) repeats this exact guard after it closes the handle.
-        if(!source.empty() && needRemove && destinationIsOursToRemove())
-            if(exists(source) && source!=destination)
-                if(!unlink(destination))
-                    ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+
-                                             "] unable to remove the partial destination: "+
-                                             TransferThread::internalStringTostring(destination));
-        break;
-    case TransferStat_PostTransfer:
-        if(needSkip)
-        {
-            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] skip already in progress");
-            return;
-        }
+        if(workerInsidePipeline.load())
+            return;// the worker's tail removes the partial (after ITS close) and publishes Idle
+        // error-wait: the worker closed everything and sits idle until this decision -> finish here
+        if(!stopFinalized.exchange(true))
+            finalizeStoppedTransfer();
+        return;
+    case TransferStat_Checksum:
+        // the verify loop polls stopIt (set above) and gives up; checkIfAllIsClosedAndDoOperations then
+        // completes on the worker with needSkip -> a MOVE keeps its source (unverified = not done)
         needSkip=true;
-        closeFiles();
-        break;
+        return;
+    case TransferStat_PostTransfer:
     case TransferStat_PostOperation:
-        break;
+        // transient states INSIDE the worker's own completion tail: it reaches Idle and emits by itself
+        needSkip=true;
+        return;
     default:
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] can't skip in this state: "+std::to_string(transfer_stat));
         return;
@@ -1173,6 +1237,13 @@ void TransferThreadPipelined::setFileExistsActionInternal(const FileExistsAction
 }
 
 void TransferThreadPipelined::retryAfterError()
+{
+    // queued to the worker thread: it runs only once the worker is back in its event loop, i.e. after
+    // the failed attempt's tail (cancel-drain, trim, close) has fully finished -- never underneath it
+    emit internalStartRetryAfterError();
+}
+
+void TransferThreadPipelined::retryAfterErrorInternal()
 {
     if(transfer_stat==TransferStat_Idle)
     {

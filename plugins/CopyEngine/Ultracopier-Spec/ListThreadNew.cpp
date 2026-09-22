@@ -5,7 +5,7 @@
 
 // TransferThreadImpl typedef comes from ListThread.h
 
-// -> add thread safe, by Qt::BlockingQueuedConnection
+//the scan pool and the options live on the list thread: run the request there (blocking, keeps the bool)
 bool ListThread::newCopy(const std::vector<std::string> &sources,const std::string &destination)
 {
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"sources: "+stringimplode(sources,";")+", destination: "+destination);
@@ -13,11 +13,21 @@ bool ListThread::newCopy(const std::vector<std::string> &sources,const std::stri
     if(hasRemoteUrl(sources,destination))
         return newCopyKio(sources,destination);
     #endif
+    if(QThread::currentThread()==this)
+        newCopyInternal(sources,destination);
+    else
+        emit newCopySend(sources,destination);
+    return newTransferAccepted;
+}
+
+void ListThread::newCopyInternal(const std::vector<std::string> &sources,const std::string &destination)
+{
+    newTransferAccepted=false;
     ScanFileOrFolder * scanFileOrFolderThread=newScanThread(Ultracopier::Copy);
     if(scanFileOrFolderThread==NULL)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"unable to get new thread");
-        return false;
+        return;
     }
     std::regex base_regex("^[a-z][a-z][a-z]*:/.*");
     std::smatch base_match;
@@ -41,7 +51,7 @@ bool ListThread::newCopy(const std::vector<std::string> &sources,const std::stri
             source.replace(0,6,"");
         #endif
         else if (std::regex_match(source, base_match, base_regex))
-            return false;
+            return;
         if(index<99)
         {
             if(sources.at(index)!=source)
@@ -70,10 +80,9 @@ bool ListThread::newCopy(const std::vector<std::string> &sources,const std::stri
     scanFileOrFolderThread->addToList(sourcesClean,Wdest);
     scanThreadHaveFinish(true);
     detectDrivesOfCurrentTransfer(sourcesClean,Wdest);
-    return true;
+    newTransferAccepted=true;
 }
 
-// -> add thread safe, by Qt::BlockingQueuedConnection
 bool ListThread::newMove(const std::vector<std::string> &sources,const std::string &destination)
 {
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"start");
@@ -81,7 +90,16 @@ bool ListThread::newMove(const std::vector<std::string> &sources,const std::stri
     if(hasRemoteUrl(sources,destination))
         return newMoveKio(sources,destination);
     #endif
+    if(QThread::currentThread()==this)
+        newMoveInternal(sources,destination);
+    else
+        emit newMoveSend(sources,destination);
+    return newTransferAccepted;
+}
 
+void ListThread::newMoveInternal(const std::vector<std::string> &sources,const std::string &destination)
+{
+    newTransferAccepted=false;
     #ifdef ULTRACOPIER_PLUGIN_DEBUG
     {
         unsigned int index=0;
@@ -114,7 +132,7 @@ bool ListThread::newMove(const std::vector<std::string> &sources,const std::stri
     if(scanFileOrFolderThread==NULL)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"unable to get new thread");
-        return false;
+        return;
     }
     std::regex base_regex("^[a-z][a-z][a-z]*:/.*");
     std::smatch base_match;
@@ -138,7 +156,7 @@ bool ListThread::newMove(const std::vector<std::string> &sources,const std::stri
             source.replace(0,6,"");
         #endif
         else if (std::regex_match(source, base_match, base_regex))
-            return false;
+            return;
         if(index<99)
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,sources.at(index)+" -> "+source);
         index++;
@@ -164,5 +182,5 @@ bool ListThread::newMove(const std::vector<std::string> &sources,const std::stri
     scanFileOrFolderThread->addToList(sourcesClean,Wdest);
     scanThreadHaveFinish(true);
     detectDrivesOfCurrentTransfer(sourcesClean,Wdest);
-    return true;
+    newTransferAccepted=true;
 }

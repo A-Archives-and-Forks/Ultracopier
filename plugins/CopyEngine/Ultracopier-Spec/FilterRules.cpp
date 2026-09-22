@@ -1,5 +1,6 @@
 #include "FilterRules.h"
 #include "ui_FilterRules.h"
+#include "StructEnumDefinition_CopyEngine.h"
 
 #include <QRegularExpression>
 
@@ -117,9 +118,9 @@ void FilterRules::updateChecking()
         QString tempString;
         if(ui->search_type->currentIndex()==0)
         {
-            //tempString=QRegularExpression::escape(ui->search->text()); -> generate bug because escape contains slash
-            if(tempString.contains('/') || tempString.contains('\\'))
+            if(ui->search->text().contains('/') || ui->search->text().contains('\\'))
                 isValid=false;
+            tempString=QRegularExpression::escape(ui->search->text());
         }
         else if(ui->search_type->currentIndex()==1)
         {
@@ -139,9 +140,7 @@ void FilterRules::updateChecking()
         }
         if(isValid)
         {
-            if(ui->need_match_all->isChecked())
-                tempString=QStringLiteral("^")+tempString+QStringLiteral("$");
-            regex=QRegularExpression(tempString);
+            regex=QRegularExpression(filterRegexPattern(tempString,ui->need_match_all->isChecked()));
             isValid=regex.isValid();
         }
     }

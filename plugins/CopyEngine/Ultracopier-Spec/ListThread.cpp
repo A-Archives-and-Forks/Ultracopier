@@ -71,8 +71,6 @@ ListThread::ListThread(FacilityInterface * facilityInterface) :
     opShadowChecks=0;
     opShadowSummaryLogged=false;
     #endif
-    moveToThread(this);
-    start(HighPriority);
     this->facilityInterface=facilityInterface;
     #ifdef ULTRACOPIER_PLUGIN_SPEED_SUPPORT
     clockForTheCopySpeed            = NULL;
@@ -82,6 +80,7 @@ ListThread::ListThread(FacilityInterface * facilityInterface) :
     #endif
     putInPause                      = false;
     autoStart=true;
+    newTransferAccepted=false;
     retryScheduler                  = NULL;//created+started on this thread in run()
     safetyStallTicks                = 0;
 
@@ -111,6 +110,11 @@ ListThread::ListThread(FacilityInterface * facilityInterface) :
     if(!connect(this,           &ListThread::exportTransferListSend,			this,&ListThread::exportTransferListInternal,           Qt::QueuedConnection))
         abort();
     if(!connect(this,           &ListThread::importTransferListSend,			this,&ListThread::importTransferListInternal,			Qt::QueuedConnection))
+        abort();
+    //newCopy()/newMove() are called from the GUI thread: run them here, serialized with the option slots
+    if(!connect(this,           &ListThread::newCopySend,                       this,&ListThread::newCopyInternal,                      Qt::BlockingQueuedConnection))
+        abort();
+    if(!connect(this,           &ListThread::newMoveSend,                       this,&ListThread::newMoveInternal,                      Qt::BlockingQueuedConnection))
         abort();
     #ifdef ULTRACOPIER_PLUGIN_DEBUG
     if(!connect(&mkPathQueue,	&MkPath::debugInformation,						this,&ListThread::debugInformation,	Qt::QueuedConnection))
@@ -142,6 +146,10 @@ ListThread::ListThread(FacilityInterface * facilityInterface) :
     else
         WriteThread::numberOfBlock=ULTRACOPIER_PLUGIN_DEFAULT_PARALLEL_NUMBER_OF_BLOCK;
     #endif
+
+    //last: run() writes members on the new thread, so every member above must already be set
+    moveToThread(this);
+    start(HighPriority);
 }
 
 ListThread::~ListThread()

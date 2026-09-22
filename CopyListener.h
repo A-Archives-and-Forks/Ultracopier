@@ -130,7 +130,6 @@ class CopyListener : public QObject
         static std::vector<std::string> protocolsOf(const std::vector<std::string> &paths);
         OptionDialog *optionDialog;
         bool stopIt;
-        std::regex stripSeparatorRegex;
         // dedup of a clipboard paste delivered by both the Ctrl+V hook and catchcopy (safety net)
         bool isDuplicatePaste(int mode,const std::vector<std::string> &sources,const std::string &destination);
         int lastPasteDedupMode;

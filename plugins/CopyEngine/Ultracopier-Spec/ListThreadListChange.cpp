@@ -79,6 +79,7 @@ void ListThread::moveItemsUp(std::vector<uint64_t> ids)
                 newAction.userAction.position=i;
                 actionDone.push_back(newAction);
                 std::swap(actionToDoListTransfer[i],actionToDoListTransfer[lastGoodPositionReal]);
+                lastGoodPositionReal=(int)i;//the displaced neighbour now sits at i
             }
             else
                 ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"Try move up false, item "+std::to_string(i));
@@ -127,6 +128,7 @@ void ListThread::moveItemsDown(std::vector<uint64_t> ids)
                 newAction.userAction.position=i;
                 actionDone.push_back(newAction);
                 std::swap(actionToDoListTransfer[i],actionToDoListTransfer[lastGoodPositionReal]);
+                lastGoodPositionReal=(int)i;//the displaced neighbour now sits at i
             }
             else
             {

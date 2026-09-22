@@ -140,6 +140,8 @@ void WriteThread::run()
         abort();*/
     if(!connect(this,&WriteThread::internalStartWrite,              this,&WriteThread::internalWrite,		Qt::QueuedConnection))
         abort();
+    if(!connect(this,&WriteThread::internalStartCloseSilent,        this,&WriteThread::internalCloseSilentSlot,	Qt::QueuedConnection))
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Critical,"["+std::to_string(id)+"] unable to connect internalStartCloseSilent()");
     if(!connect(this,&WriteThread::internalStartClose,              this,&WriteThread::internalCloseSlot,		Qt::QueuedConnection))
         abort();
     if(!connect(this,&WriteThread::internalStartEndOfFile,          this,&WriteThread::internalEndOfFile,		Qt::QueuedConnection))
@@ -639,22 +641,25 @@ void WriteThread::stop(bool finalNoRetry)
     stopIt=true;
     if(isOpen.available()>0)
     {
+        // The write thread holds NO destination open (isOpen is acquired for the whole open..close span,
+        // released ONLY by the internalClose() of an open file). Nothing to close here and NO close
+        // request: a close request without a matching open released isOpen a second time, after which
+        // every stop() of a genuinely OPEN file landed in this branch, pre-closed the fd from the caller
+        // thread and never emitted closed() -> a cancel or a put-to-end never completed (3.1 regression).
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] isOpen.available()>0");
-
+        // NO close of `to` from this (caller) thread: between the open() and the isOpen.acquire() of a
+        // running internalOpen() the fd is already valid while isOpen still reads "not open"; closing
+        // it here left the write thread believing it holds an open file that internalClose() then found
+        // closed (no release) -> the next open blocked on isOpen forever (a wedge seen under TSan timing).
+        // An open may still be QUEUED on the write thread (the read faulted before it ran): the close
+        // request is queued BEHIND it, so the file is opened, then closed by internalClose() which emits
+        // closed(). With nothing queued, internalClose() finds nothing open and emits nothing -- and no
+        // longer releases isOpen either (see wasOpen there), which is what used to inflate the count.
         if(finalNoRetry)
         {
-            // PURE skip, no put-to-end retry => NO reopen to race, so do NOT pre-close the fd. Wake the
-            // (possibly parked, open-but-idle) write thread and let internalClose() run its NORMAL close --
-            // truncate to lastGoodPosition + close + emit closed() -- which PERSISTS the readable salvage
-            // (needRemoveTheFile is false above) AND completes the inode so the cap=1 large-transfer slot
-            // frees for the next large file (faulty_hdd over_1mib.dat / skip_drops_multichunk /
-            // opt_delete_partial_files). If the destination was NEVER opened (read faulted at byte 0),
-            // internalClose() guards its emit on to>=0 and would hang, so signal closed() explicitly.
-            #ifdef Q_OS_WIN32
-            const bool destWasOpen=(to!=NULL);
-            #else
-            const bool destWasOpen=(to>=0);
-            #endif
+            // PURE skip of a destination that was never opened (the read faulted at byte 0, or the open
+            // failed): the transfer thread still waits for closed() to finish its state machine
+            // (remainDestinationOpen() is its own flag, not this fd), so signal it explicitly.
             writeFull.release();
             pauseMutex.release();
             pauseMutex.release();
@@ -663,32 +668,10 @@ void WriteThread::stop(bool finalNoRetry)
             waitNewClockForSpeed2.release();
             #endif
             emit internalStartClose();
-            if(!destWasOpen)
-                emit closed();
-            return;
+            emit closed();
         }
-
-        #ifdef Q_OS_WIN32
-        if(to!=NULL)
-        #else
-        if(to>=0)
-        #endif
-        {
-            #ifdef Q_OS_UNIX
-            if(::close(to)!=0)
-                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+std::to_string(errno));
-            to=-1;
-            #else
-            if(CloseHandle(to)==0)
-                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+TransferThread::GetLastErrorStdStr());
-            to=NULL;
-            #endif
-        }
-
-        // Put-to-end RETRY: pre-close the fd so internalClose() will NOT re-emit closed() and the retry's
-        // reopen (isOpen.acquire) is not raced (transient_sector); emit internalStartClose() to release
-        // isOpen and wake the parked write thread. The inode completes via the eventual successful retry.
-        emit internalStartClose();
+        else
+            emit internalStartClose();
         return;
     }
     writeFull.release();
@@ -698,10 +681,46 @@ void WriteThread::stop(bool finalNoRetry)
     waitNewClockForSpeed.release();
     waitNewClockForSpeed2.release();
     #endif
+    if(finalNoRetry)
+    {
+        // PURE skip, no put-to-end retry => NO reopen to race. Wake the (possibly parked, open-but-idle)
+        // write thread and let internalClose() run its NORMAL close -- salvage drain + truncate to
+        // lastGoodPosition + close + emit closed() -- which PERSISTS the readable salvage
+        // (needRemoveTheFile is false above) AND completes the inode so the cap=1 large-transfer slot
+        // frees for the next large file (faulty_hdd over_1mib.dat / skip_drops_multichunk /
+        // opt_delete_partial_files).
+        emit internalStartClose();
+        return;
+    }
+    // cancel / put-to-end: the write thread closes its OWN fd (never a cross-thread close), removes the
+    // partial per needRemoveTheFile and emits closed() exactly once.
     // useless because stopIt will close all thread, but if thread not runing run it
     endIsDetected();
     //for the stop for skip: void TransferThread::skip()
     emit internalStartClose();
+}
+
+void WriteThread::abortForRetry()
+{
+    if(isOpen.available()>0)
+        return;// nothing open: nothing to close, and no signal to suppress
+    ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] abortForRetry()");
+    stopIt=true;
+    needRemoveTheFile=true;// the partial is rewritten from 0 by the retry (no truncate to keep, no salvage)
+    salvageBufferedOnClose=false;
+    writeFull.release();
+    pauseMutex.release();
+    pauseMutex.release();
+    #ifdef ULTRACOPIER_PLUGIN_SPEED_SUPPORT
+    waitNewClockForSpeed.release();
+    waitNewClockForSpeed2.release();
+    #endif
+    emit internalStartCloseSilent();
+}
+
+void WriteThread::internalCloseSilentSlot()
+{
+    internalClose(false);
 }
 
 void WriteThread::flushBuffer()
@@ -862,14 +881,15 @@ void WriteThread::internalClose(bool emitSignal)
     status=Close;
     #endif
     bool emit_closed=false;
+    #ifdef Q_OS_WIN32
+    const bool wasOpen=(to!=NULL);
+    #else
+    const bool wasOpen=(to>=0);
+    #endif
     if(!fakeMode)
     {
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] !fakeMode: "+TransferThread::internalStringTostring(file));
-        #ifdef Q_OS_WIN32
-        if(to!=NULL)
-        #else
-        if(to>=0)
-        #endif
+        if(wasOpen)
         {
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] to>=0: "+TransferThread::internalStringTostring(file));
             if(!needRemoveTheFile)
@@ -911,7 +931,10 @@ void WriteThread::internalClose(bool emitSignal)
                     }
                 }
                 // --- END #23 read-salvage-drain ---
-                if(startSize!=lastGoodPosition)
+                // Also truncate when NOTHING was written over a PRE-EXISTING destination on a normal
+                // (not stopped) close: an EMPTY source overwriting a non-empty file. The open no longer
+                // truncates (#9), so without this the old content survived and was reported as copied.
+                if(startSize!=lastGoodPosition || (destinationPreExisted && !stopIt))
                     if(destTruncate(lastGoodPosition)!=0)
                     {
                         if(emitSignal)
@@ -936,31 +959,33 @@ void WriteThread::internalClose(bool emitSignal)
                             needRemoveTheFile=true;
                     }
             }
+            // A failed close() is where a writeback-cached write error (NFS/CIFS/USB: EDQUOT/ENOSPC/EIO)
+            // surfaces. On a completing file it MUST be reported like a write error, never as success
+            // (a MOVE would then delete the source). Queued before closed(): write_error() runs first.
             #ifdef Q_OS_UNIX
             if(::close(to)!=0)
-                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+std::to_string(errno));
+            {
+                const int t=errno;
+                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+std::to_string(t));
+                if(emitSignal && !needRemoveTheFile && !stopIt)
+                {
+                    errorString_internal=tr("Unable to close the destination: ").toStdString()+strerror(t);
+                    emit error();
+                }
+            }
             to=-1;
             #else
             if(CloseHandle(to)==0)
-                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+TransferThread::GetLastErrorStdStr());
-            to=NULL;
-            #endif
-            this->file.clear();
-            if(needRemoveTheFile || stopIt)
             {
-                if(deletePartiallyTransferredFiles)
+                ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to close: "+TransferThread::GetLastErrorStdStr());
+                if(emitSignal && !needRemoveTheFile && !stopIt)
                 {
-                    if(unlink(TransferThread::internalStringTostring(file).c_str())!=0)
-                        if(emitSignal)
-                        {
-                            #ifdef Q_OS_UNIX
-                            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] unable to remove the destination file: "+std::to_string(errno));
-                            #else
-                            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] unable to remove the destination file: "+TransferThread::GetLastErrorStdStr());
-                            #endif
-                        }
+                    errorString_internal=tr("Unable to close the destination: ").toStdString()+TransferThread::GetLastErrorStdStr();
+                    emit error();
                 }
             }
+            to=NULL;
+            #endif
             //here and not after, because the transferThread don't need try close if not open
             if(emitSignal)
                 emit_closed=true;
@@ -983,8 +1008,10 @@ void WriteThread::internalClose(bool emitSignal)
     status=Idle;
     #endif
 
-    /// \note always the last of this function
-    if(!fakeMode)
+    /// \note always the last of this function; matches the acquire of internalOpen(), so ONLY a close of
+    /// a file that was really open releases (an extra release let stop() mistake an open file for a
+    /// closed one -- see stop()).
+    if(!fakeMode && wasOpen)
         isOpen.release();
 }
 
@@ -1110,11 +1137,14 @@ void WriteThread::setDeletePartiallyTransferredFiles(const bool &deletePartially
 
 bool WriteThread::write(char * data, const unsigned int size)
 {
+    // a block refused BEFORE it is queued still belongs to the caller: free it here (the reader
+    // never frees a block it handed over, whether or not the queue took it)
     if(stopIt)
+    {
+        free(data);
         return false;
+    }
     bool atMax;
-    if(stopIt)
-        return false;
     {
         QMutexLocker lock_mutex(&accessList);
         DataBlock d;
@@ -1325,6 +1355,9 @@ void WriteThread::internalWrite()
             /// in version 2, full close and retry from open(), see comment into TransferThreadAsync::retryAfterError()
             internalClose(false);
             flushBuffer();
+            // the destination is closed: let the transfer thread know (queued AFTER error(), like a failed
+            // open) so a later cancel / put-to-end / skip does not wait forever for a close of nothing
+            emit closed();
             return;
         }
         if(bytesWriten!=blockArray.size)
@@ -1342,6 +1375,9 @@ void WriteThread::internalWrite()
             /// in version 2, full close and retry from open(), see comment into TransferThreadAsync::retryAfterError()
             internalClose(false);
             flushBuffer();
+            // the destination is closed: let the transfer thread know (queued AFTER error(), like a failed
+            // open) so a later cancel / put-to-end / skip does not wait forever for a close of nothing
+            emit closed();
             return;
         }
         lastGoodPosition+=bytesWriten;

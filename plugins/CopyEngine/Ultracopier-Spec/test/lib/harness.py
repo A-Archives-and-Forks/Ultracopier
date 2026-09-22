@@ -301,10 +301,19 @@ def spec_section(*, file_collision, folder_collision, file_error, folder_error,
     return opts
 
 
-def _render_conf(opts: dict, nl: str) -> str:
-    """Render the full isolated QSettings INI from the spec-section mapping."""
+def _render_conf(opts: dict, nl: str, extra_sections=None) -> str:
+    """Render the full isolated QSettings INI from the spec-section mapping. `extra_sections`
+    ({section: {key: value}}) adds CORE groups such as Write_log verbatim."""
+    def kv_line(k, v):
+        # QSettings reads an UNQUOTED ini value only up to the first ';' (measured 2026-09-21, Qt 6.7:
+        # "a;b" -> "a"); a double-quoted value survives intact, which is what QSettings itself writes
+        v = str(v)
+        return f'{k}="{v}"' if ";" in v else f"{k}={v}"
     lines = ["[CopyEngine-Ultracopier Spec]"]
-    lines += [f"{k}={v}" for k, v in opts.items()]
+    lines += [kv_line(k, v) for k, v in opts.items()]
+    for section, kv in (extra_sections or {}).items():
+        lines.append(f"[{section}]")
+        lines += [kv_line(k, v) for k, v in kv.items()]
     lines += ["[CopyEngine]", "List=Ultracopier-Spec",
               "[Ultracopier]", "GroupWindowWhen=0", "confirmToGroupWindows=false",
               # Suppress the OSSpecific "replacement of default copy/move ... not supported by the
@@ -317,7 +326,7 @@ def _render_conf(opts: dict, nl: str) -> str:
 
 def write_config(home: pathlib.Path, *, file_collision, folder_collision, file_error,
                  folder_error, keep_date=True, do_right=True, inode_threads=None,
-                 extra_options=None):
+                 extra_options=None, extra_sections=None):
     # The OptionEngine reads QSettings("Ultracopier","Ultracopier") -> $XDG_CONFIG_HOME/Ultracopier/
     # Ultracopier.conf (capital-U dir AND file; ResourcesManager EXTRA_HOME_PATH "/.config/Ultracopier/").
     cdir = home / ".config" / "Ultracopier"; cdir.mkdir(parents=True, exist_ok=True)
@@ -327,7 +336,7 @@ def write_config(home: pathlib.Path, *, file_collision, folder_collision, file_e
                         file_error=file_error, folder_error=folder_error,
                         keep_date=keep_date, do_right=do_right, inode_threads=inode_threads,
                         extra_options=extra_options)
-    conf.write_text(_render_conf(opts, "\n"))
+    conf.write_text(_render_conf(opts, "\n", extra_sections))
     return conf
 
 
@@ -495,7 +504,7 @@ def _run_impl(backend: str, mode: str, sources, dest, *, cfg=None,
         keep_date=True, do_right=True, expect_dir=None, memcheck=NONE,
         fs_preload=None, mem_limit_mb=None, stay_alive_seconds=None,
         append_after=None, remove_after=None, inode_threads=None,
-        extra_options=None) -> Result:
+        extra_options=None, extra_sections=None) -> Result:
     """Run one real cp/mv through `backend` and observe it from the outside.
 
     mode: 'cp' or 'mv'.  sources: list[str] (absolute).  dest: str (absolute).
@@ -528,7 +537,8 @@ def _run_impl(backend: str, mode: str, sources, dest, *, cfg=None,
     home = pathlib.Path(tempfile.mkdtemp(prefix="uc-test-home-"))
     write_config(home, file_collision=file_collision, folder_collision=folder_collision,
                  file_error=file_error, folder_error=folder_error, keep_date=keep_date, do_right=do_right,
-                 inode_threads=inode_threads, extra_options=extra_options)
+                 inode_threads=inode_threads, extra_options=extra_options,
+                 extra_sections=extra_sections)
     _kill_all_ultracopier()
 
     env = dict(os.environ)
@@ -740,6 +750,14 @@ def _run_impl(backend: str, mode: str, sources, dest, *, cfg=None,
         io = _io_bytes(pid)
         rd = _rchar_bytes(pid)
         state = _proc_state(pid)
+        if state == "Z":
+            # The engine EXITED but is not reaped yet (a zombie keeps its /proc entry, and its io
+            # counters read -1 -> the deltas below looked like "progress"): without this a crashed
+            # engine (e.g. the TSan+Qt CHECK abort) sat out the whole absolute ceiling. Same handling
+            # as the /proc-gone branch above.
+            exit_code = proc.poll()
+            oom = oom or _was_oom(proc, exit_code) or _dmesg_oom(started)
+            break
         if state == "T":
             # Externally FROZEN (SIGSTOP / ptrace stop) -- neither working, nor idle-done, nor
             # hung-on-its-own. Real CPU/memory load NEVER produces 'T' (a starved-runnable task is

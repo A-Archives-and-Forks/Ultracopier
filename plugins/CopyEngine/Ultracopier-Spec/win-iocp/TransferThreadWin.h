@@ -49,7 +49,9 @@ private:
         int bytesUsed;      // bytes currently held in this buffer (valid data length)
         int64_t fileOffset; // source/destination offset this buffer's data belongs to
         unsigned int chunkSize; // intended size of the chunk assigned to this buffer
-        OVERLAPPED ov;      // per-buffer overlapped struct; Offset holds the file offset
+        OVERLAPPED *ov;     // per-buffer overlapped struct, heap-allocated WITH the data block so a wedged
+                            // IRP that outlives the drain keeps writing its status into a quarantined
+                            // OVERLAPPED, never into the one the next file re-arms; Offset = file offset
         enum State { Free, Reading, WriteReady, Writing } state;
     };
     PipelineBuffer pipelineBuffers[NUM_BUFFERS];
@@ -60,6 +62,7 @@ private:
     // worker still lives -- we orphan it here and free it only in the destructor, AFTER wait(). Bounded:
     // at most NUM_BUFFERS entries per unrecoverable stuck-I/O event.
     std::vector<char*> orphanedBuffers;
+    std::vector<OVERLAPPED*> orphanedOverlapped;
 
     HANDLE iocp;            // I/O completion port, all handles associated to it
     bool iocpInitialized;
@@ -90,6 +93,7 @@ private:
     void interruptTransferForStop() override {}
     bool remainSourceOpen() const override;
     bool remainDestinationOpen() const override;
+    void trimDestinationToContiguous() override;
     /// \brief SetFileTime() on the still-open destHandle using the cached source times
     /// (ftCreate/ftAccess/ftWrite), avoiding the per-file reopen in doFilePostOperation.
     bool applyDateTimeOnOpenDestination() override;

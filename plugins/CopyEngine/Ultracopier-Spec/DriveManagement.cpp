@@ -84,8 +84,11 @@ std::string DriveManagement::getDrive(const std::string &fileOrFolder) const
     #else
     int size=(int)mountSysPoint.size();
     for (int i = 0; i < size; ++i) {
-        if(stringStartWith(inode,mountSysPoint.at(i)))
-            return mountSysPoint.at(i);
+        const std::string &mountPoint=mountSysPoint.at(i);
+        // on a path-component boundary: "/mnt/data2/x" is NOT under the "/mnt/data" mount
+        if(!mountPoint.empty() && stringStartWith(inode,mountPoint)
+                && (mountPoint.back()=='/' || inode.size()==mountPoint.size() || inode.at(mountPoint.size())=='/'))
+            return mountPoint;
     }
     #endif
     //if unable to locate the right mount point

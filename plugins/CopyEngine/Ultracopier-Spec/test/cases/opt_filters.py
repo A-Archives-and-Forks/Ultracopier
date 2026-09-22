@@ -69,6 +69,8 @@ SRC_FILES = {
     os.path.join("sub", "inner.txt"): b"nested non-matching\n",
     os.path.join("sub", "inner.keep"): b"KEEP-nested\n",
     os.path.join("sub", "trace.log"): b"LOG-nested\n",
+    "notes.keep.old":    b"KEEP-substring\n",      # '.keep' INSIDE the name: matched by the substring rule only
+    "trace.log.1":       b"LOG-rotated\n",         # '.log' inside the name: excluded by the substring rule
 }
 # A multi-chunk (> blockSize) non-matching file, so a real read/write transfer is exercised
 # for a SURVIVING file under both rules (proves filtering does not break normal copying).
@@ -94,11 +96,17 @@ def _all_rels() -> set:
 
 
 # Basename-regex (simpleRegex wildcard) partitions of the file set ------------------------
+# Rule semantics since 2026-09-21 (Filters::convertToRegex + the FilterRules preview agree): a rule
+# WITHOUT need_match_all matches any SUBSTRING of the name, WITH it the whole name.
 def _matches_log(rel: str) -> bool:
-    return os.path.basename(rel).endswith(".log")
+    return ".log" in os.path.basename(rel)
 
 
 def _matches_keep(rel: str) -> bool:
+    return ".keep" in os.path.basename(rel)
+
+
+def _matches_keep_whole(rel: str) -> bool:
     return os.path.basename(rel).endswith(".keep")
 
 
@@ -121,6 +129,10 @@ INCLUDE_OPTS = {
     "includeStrings": "*.keep",
     "includeOptions": "SearchType_simpleRegex",
 }
+INCLUDE_FULL_OPTS = {   # 'Full match' ticked: the WHOLE name must match -> notes.keep.old is out
+    "includeStrings": "*.keep",
+    "includeOptions": "SearchType_simpleRegex;need_match_all",
+}
 
 
 def _expected_present(rule: str) -> set:
@@ -134,6 +146,8 @@ def _expected_present(rule: str) -> set:
         # 'sub' does NOT match '*.keep', so it is never descended and sub/inner.keep is never
         # even scanned -> only the TOP-LEVEL .keep files survive (nested .keep is ABSENT).
         return {r for r in allr if _matches_keep(r) and ("/" not in r and os.sep not in r)}
+    elif rule == "include_keep_full":
+        return {r for r in allr if _matches_keep_whole(r) and ("/" not in r and os.sep not in r)}
     elif rule == "off":
         return set(allr)
     raise ValueError(rule)
@@ -235,6 +249,21 @@ def run(backends=None, memcheck=H.NONE) -> bool:
                   f"content={r4.content_ok} mem_errors={r4.mem_errors}\n{r4.diff_text}")
             ok = False
         if not _check(copied_in_off, _expected_present("off"), "incl off"):
+            ok = False
+
+        # ---- INCLUDE "*.keep" + Full match : whole-name only (notes.keep.old ABSENT) ------
+        dest_full = K.fresh_dest("optfilters_incl_full")
+        r5 = H.run(backend, "cp", [src], dest_full,
+                   file_collision=H.FileCollision.OVERWRITE,
+                   folder_collision=H.FolderCollision.MERGE,
+                   expect_dir=None, memcheck=memcheck,
+                   extra_options=dict(INCLUDE_FULL_OPTS))
+        copied_full = K.copied_root(dest_full, src)
+        if not (r5.completed and r5.stayed_alive and not r5.oom_killed and r5.mem_errors == 0):
+            print(f"      [incl full] run not ok: completed={r5.completed} alive={r5.stayed_alive} "
+                  f"oom={r5.oom_killed} mem_errors={r5.mem_errors}\n{r5.notes}")
+            ok = False
+        if not _check(copied_full, _expected_present("include_keep_full"), "incl full"):
             ok = False
 
         return ok

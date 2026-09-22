@@ -31,7 +31,7 @@ FileErrorDialog::FileErrorDialog(QWidget *parent, INTERNALTYPEPATH fileInfo, std
     setWindowFlags(flags);
 
     ui->setupUi(this);
-    action=FileError_Cancel;
+    action=FileError_Cancel;//Esc/close keep Cancel: the whole job stops, like the button (deliberate)
     ui->label_error->setText(QString::fromStdString(errorString));
 #ifdef Q_OS_WIN32
     WIN32_FILE_ATTRIBUTE_DATA fileInfoW;

@@ -23,6 +23,7 @@ other. A backend subclass implements only the I/O hooks (open/close/doTransferPi
 #include <vector>
 #include <string>
 #include <utility>
+#include <atomic>
 
 //before the next define
 #include "../CopyEngineUltracopier-SpecVariable.h"
@@ -84,10 +85,16 @@ private slots:
     /// and a non-empty contiguous prefix is already written) resume the transfer at
     /// contiguousWrittenOffset; otherwise restart from 0. Wired to internalStartResumeAfterErrorAndSeek.
     void resumeAfterErrorAndSeek();
+    /// \brief the retry decision, run ON THE WORKER THREAD (queued from retryAfterError): a retry
+    /// answered while the worker is still draining the failed attempt would otherwise close its
+    /// fds and clear its error flags underneath it, and the worker's tail then reported the partial
+    /// file as COMPLETE (the retry itself was then refused as "already used").
+    void retryAfterErrorInternal();
 
     void setFileExistsActionInternal(const FileExistsAction &action);
 signals:
     void internalStartResumeAfterErrorAndSeek() const;
+    void internalStartRetryAfterError() const;
     void internalStartPostOperation() const;
     void openReadSignal(const INTERNALTYPEPATH &file, const Ultracopier::CopyMode &mode);
     void openWriteSignal(const INTERNALTYPEPATH &file, const uint64_t &startSize);
@@ -130,6 +137,11 @@ protected:
     virtual void interruptTransferForStop() { closeFiles(); }
     virtual bool remainSourceOpen() const=0;
     virtual bool remainDestinationOpen() const=0;
+    /// \brief cut the still-open destination to contiguousWrittenOffset so a KEPT partial (pure fault
+    /// skip salvage, media-reconnect resume prefix) is a faithful prefix: the out-of-order pipelined
+    /// writes may have landed bytes above a hole. Called by the base before closeFiles() on every
+    /// non-success exit of a destination that is ours. Best-effort (a failure only leaves a longer file).
+    virtual void trimDestinationToContiguous()=0;
     /// \brief handle a symlinked source. Return true if fully handled (success OR error
     /// already emitted); false to fall back to a normal pipelined copy. Default: false
     /// (follow the link / copy as a regular file). The POSIX backend overrides it.
@@ -159,6 +171,11 @@ protected:
     /// invariant). Used by the #25 corrupt-dest cleanup so a checksum-failed copy never deletes a
     /// user's pre-existing destination. Backed by destinationPreExisted, captured in preOperation().
     bool destinationIsOursToRemove() const;
+    /// \brief the ONE completion of a stopped/skipped transfer (partial cleanup, Idle, postOperationStopped),
+    /// run by whichever side owns the tail: the worker when it is inside the pipeline, else the caller of
+    /// stop()/skip(). stopFinalized guarantees it runs at most once per attempt.
+    void finalizeStoppedTransfer();
+    void finalizeIfStopRequested();
 
     /// \brief fold a just-COMPLETED destination write extent [off, off+len) into the
     /// contiguous-from-0 low-water mark. MUST be called once per write completion with the
@@ -206,6 +223,12 @@ protected:
     bool destinationPreExisted=false;
 
     volatile bool putInPause;
+    /// \brief true while the worker thread runs the copy of the current file (open..close): a stop()/skip()
+    /// arriving then only sets the flags and lets the worker finish -- publishing Idle from the caller thread
+    /// while the worker still copied let ListThread hand it the NEXT file underneath (its tail then unlinked
+    /// the new destination and reported the new entry done without copying it).
+    std::atomic<bool> workerInsidePipeline;
+    std::atomic<bool> stopFinalized;
 
     #ifdef ULTRACOPIER_PLUGIN_SPEED_SUPPORT
     QSemaphore waitNewClockForSpeed;

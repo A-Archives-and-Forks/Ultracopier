@@ -5,6 +5,7 @@
 
 #include <string>
 #include <regex>
+#include <QRegularExpression>
 #include <cstdint>
 
 #ifndef STRUCTDEF_COPYENGINE_H
@@ -95,8 +96,14 @@ struct Filters_rules
     SearchType search_type;
     ApplyOn apply_on;
     bool need_match_all;
-    std::regex regex;
+    QRegularExpression regex;// the dialog validates with the same engine; std::regex threw on a PCRE-only rule
 };
+
+/// the pattern a file name is matched against: the whole name when needMatchAll, any substring otherwise
+inline QString filterRegexPattern(const QString &core,const bool needMatchAll)
+{
+    return needMatchAll ? QStringLiteral("^(?:")+core+QStringLiteral(")\\z") : core;
+}
 
 /// \brief get action type
 enum ActionType

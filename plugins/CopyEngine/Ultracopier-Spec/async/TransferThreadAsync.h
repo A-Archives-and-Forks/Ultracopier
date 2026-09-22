@@ -92,6 +92,11 @@ protected:
 private slots:
     void preOperation();
     void postOperation();
+    /// \brief the retry decision, run ON THIS thread (queued from retryAfterError): the answer to the
+    /// error dialog arrives from the main thread, possibly before this thread has consumed the
+    /// close events of the failed attempt; resetting the flags then let a late closed() complete the
+    /// partial as done. Queued behind them, the reset is safe and the flags start fresh.
+    void retryAfterErrorInternal();
     //force into the right thread
     void internalStartTheTransfer();
 
@@ -110,6 +115,7 @@ signals:
     // working version lives in the io_uring/IOCP pipelined backends. See ReadThread.h note.
     //void internalStartResumeAfterErrorAndSeek() const;
     void internalStartPostOperation() const;
+    void internalStartRetryAfterError() const;
     //async due to tread conflict on from, if(from>=0) {do something, abort() -> on abort from =-1}
     void openRead(const INTERNALTYPEPATH &file, const Ultracopier::CopyMode &mode);
     //async due to tread conflict on to, if(to>=0) {do something, abort() -> on abort to =-1}

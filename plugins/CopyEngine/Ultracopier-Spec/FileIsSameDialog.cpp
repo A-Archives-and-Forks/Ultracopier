@@ -35,7 +35,7 @@ FileIsSameDialog::FileIsSameDialog(QWidget *parent, INTERNALTYPEPATH fileInfo,
     setWindowFlags(flags);
 
     ui->setupUi(this);
-    action=FileExists_Cancel;
+    action=FileExists_Cancel;//Esc/close keep Cancel: the whole job stops, like the button (deliberate)
     oldName=TransferThread::resolvedName(TransferThread::internalStringTostring(fileInfo));
     destinationInfo=TransferThread::internalStringTostring(fileInfo);
     ui->lineEditNewName->setText(QString::fromStdString(oldName));

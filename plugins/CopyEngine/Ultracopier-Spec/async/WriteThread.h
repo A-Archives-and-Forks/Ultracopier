@@ -56,6 +56,10 @@ public:
     /// \brief to stop all (finalNoRetry: pure skip with no put-to-end retry -> signal closed() so the
     /// inode's close handshake can finish even though the fd was pre-closed; see WriteThread::stop())
     void stop(bool finalNoRetry=false);
+    /// \brief a retry of a failed attempt: close a still-open destination WITHOUT closed() -- that signal
+    /// would land in the NEW attempt's state machine and, the reader being already closed, complete the
+    /// partial as done. Runs on the write thread (it owns the fd); the reopen is queued behind it.
+    void abortForRetry();
     /// \brief to write data
     bool write(char *data, const unsigned int size);
     #ifdef ULTRACOPIER_PLUGIN_DEBUG
@@ -127,6 +131,7 @@ signals:
     //void internalStartReopen() const;
     void internalStartWrite() const;
     void internalStartClose() const;
+    void internalStartCloseSilent() const;
     void internalStartEndOfFile() const;
     void internalStartFlushAndSeekToZero() const;
     void openWriteSend(const INTERNALTYPEPATH &file,const uint64_t &startSize);
@@ -184,6 +189,7 @@ private slots:
     bool internalOpen();
     void internalWrite();
     void internalCloseSlot();
+    void internalCloseSilentSlot();
     void internalClose(bool emitSignal=true);
     //void internalReopen();
     void internalEndOfFile();

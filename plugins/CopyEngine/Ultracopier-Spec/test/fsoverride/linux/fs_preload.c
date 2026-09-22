@@ -161,9 +161,12 @@ enum uc_verb {
                      /* matches <substr> (models a bad sector in a directory's OWN blocks): the scan */
                      /* MUST surface it, not treat the partial listing as a complete directory and */
                      /* silently drop every entry after the fault                                    */
-    UC_SYMLINKFAIL   /* symlink() to a matching DEST linkpath fails -1/EPERM (models Windows 1314    */
+    UC_SYMLINKFAIL,  /* symlink() to a matching DEST linkpath fails -1/EPERM (models Windows 1314    */
                      /* ERROR_PRIVILEGE_NOT_HELD from CreateSymbolicLink without the privilege): the */
                      /* engine must SKIP the un-creatable symlink and COMPLETE the job, never hang    */
+    UC_CLOSEFAIL     /* close() of a matching path really closes the fd but returns -1/EIO: models a */
+                     /* writeback-cached write error (NFS/CIFS/USB) that only surfaces at close(); the */
+                     /* engine must report the file as failed, never as copied (a MOVE keeps its source) */
 };
 
 struct uc_rule {
@@ -383,6 +386,9 @@ static void uc_parse(void)
             strncpy(r->arg, arg, UC_MAX_ARG - 1);
         } else if (strcmp(tok, "symlinkfail") == 0) {
             r->verb = UC_SYMLINKFAIL;
+            strncpy(r->arg, arg, UC_MAX_ARG - 1);
+        } else if (strcmp(tok, "closefail") == 0) {
+            r->verb = UC_CLOSEFAIL;
             strncpy(r->arg, arg, UC_MAX_ARG - 1);
         } else if (strcmp(tok, "dtunknown") == 0) {
             r->verb = UC_DTUNKNOWN;   /* path-independent: arg stays "" so uc_match(UC_DTUNKNOWN,"") matches */
@@ -889,9 +895,16 @@ int openat(int dirfd, const char *pathname, int flags, ...)
 int close(int fd)
 {
     UC_REAL(close);
-    uc_optrace("CLOSE", uc_fd_path(fd), fd, 0);   /* log with the path BEFORE we forget the fd */
+    const char *path = uc_fd_path(fd);
+    uc_optrace("CLOSE", path, fd, 0);   /* log with the path BEFORE we forget the fd */
+    const int fail = (uc_match(UC_CLOSEFAIL, path) != NULL);
     uc_forget_fd(fd);
-    return real_close(fd);
+    const int rc = real_close(fd);
+    if (fail) {
+        errno = EIO;   /* the fd IS closed (no leak); the deferred write error is what the caller sees */
+        return -1;
+    }
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */

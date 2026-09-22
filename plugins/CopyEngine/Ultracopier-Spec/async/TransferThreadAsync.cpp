@@ -107,6 +107,8 @@ TransferThreadAsync::TransferThreadAsync() :
     //the thread change operation
     if(!connect(this,&TransferThread::internalStartPreOperation,	this,					&TransferThreadAsync::preOperation,          Qt::QueuedConnection))
         abort();
+    if(!connect(this,&TransferThreadAsync::internalStartRetryAfterError,this,				&TransferThreadAsync::retryAfterErrorInternal,Qt::QueuedConnection))
+        abort();
     if(!connect(this,&TransferThread::internalStartPostOperation,	this,					&TransferThreadAsync::postOperation,         Qt::QueuedConnection))
         abort();
     // async readyForReuse() == sended_state_postOperationStopped. The explicit emission points
@@ -349,9 +351,11 @@ void TransferThreadAsync::preOperation()
         return;
     }
 
-    //this case is used only on retry after error
+    //this case is used only on retry after error: a destination still open from the failed attempt is
+    //closed SILENTLY -- its closed() would otherwise reach this new attempt, whose read side is already
+    //flagged closed, and complete the partial as if copied (media_reconnect)
     readThread.stop();
-    writeThread.stop();
+    writeThread.abortForRetry();
 
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] after is same");
     /*Why this code?
@@ -919,7 +923,7 @@ void TransferThreadAsync::ifCanStartTransfer()
                 if(exists(source) && source!=destination && destinationIsOursToRemove())
                 {
                     UC_RSD((finalSkipNoRetry&&(readError||writeError))?"tt886-KEEP(salvage)":"tt886-unlink", destination);
-                    if(!finalSkipNoRetry || !(readError||writeError))
+                    if(deletePartiallyTransferredFiles && (!finalSkipNoRetry || !(readError||writeError)))
                         unlink(destination);
                 }
             // --- END #23 read-salvage-drain ---
@@ -940,6 +944,7 @@ void TransferThreadAsync::ifCanStartTransfer()
         else
         {
             ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"!successFull on write");
+            writeError=true;// the failed rename is a destination-side error: stop() needs a flag to reach Idle
             emit errorOnFile(destination,strError);
         }
         #endif
@@ -1106,7 +1111,7 @@ void TransferThreadAsync::checkIfAllIsClosedAndDoOperations()
     // this on realMove success), so the destination IS the moved file -- never a partial of ours.
     // destinationIsOursToRemove() reads stale writeThread state for a realMove and must not be trusted;
     // a concurrent skip/cancel (stopIt/needSkip) must NOT delete the successfully-moved destination.
-    if(!realMove && !source.empty() && needRemove && (stopIt || needSkip) && destinationIsOursToRemove()
+    if(!realMove && !source.empty() && needRemove && deletePartiallyTransferredFiles && (stopIt || needSkip) && destinationIsOursToRemove()
             && (!finalSkipNoRetry || !(readError||writeError) || TransferThread::file_stat_size(destination)<=0))
         if(is_file(source) && source!=destination)
         {
@@ -1222,16 +1227,28 @@ void TransferThreadAsync::stop()
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] transfer_stat==TransferStat_Idle");
         return;
     }
-    if(transfer_stat==TransferStat_PreOperation)
+    if(transfer_stat==TransferStat_PreOperation || transfer_stat==TransferStat_WaitForTheTransfer)
     {
+        // nothing is open yet (the wait for the large-transfer slot included): no close event will ever
+        // come, so go Idle here or the cancel never completes (checkIfReadyToCancel waits for Idle)
         transfer_stat=TransferStat_Idle;
-        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] transfer_stat==TransferStat_PreOperation");
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] stop before the transfer started");
         return;
     }
     if(realMove)
     {
         if(readError || writeError)
             transfer_stat=TransferStat_Idle;
+        return;
+    }
+    if((readError || writeError) && !remainFileOpen())
+    {
+        // error-wait with both files already closed (a write error closes its own fd): no close event
+        // will ever come, so finalize here or the cancel never reaches Idle (checkIfReadyToCancel)
+        if(!source.empty() && needRemove && deletePartiallyTransferredFiles && destinationIsOursToRemove())
+            if(is_file(source) && source!=destination)
+                unlink(destination);
+        transfer_stat=TransferStat_Idle;
         return;
     }
     readThread.stop();
@@ -1253,31 +1270,23 @@ void TransferThreadAsync::skip()
     case TransferStat_PreOperation:
         if(needSkip)
         {
-            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] skip already in progress");
             return;
         }
         needSkip=true;
-        //check if all is source and destination is closed
-        if(remainFileOpen())
-        {
-            if(remainSourceOpen())
-                readThread.stop();
-            if(remainDestinationOpen())
-                writeThread.stop(finalSkipNoRetry);
-            //read/write threads are still closing on the TRANSFER thread; their close events
-            //(read_closed/write_closed) will reach checkIfAllIsClosedAndDoOperations() which emits
-            //postOperationStopped() exactly once. Do NOT fall through to the end-block: re-reading
-            //remainFileOpen() there races those same flags and double-emits (the put-to-end stall).
-            resetExtraVariable();
-            return;
-        }
-        else // wait nothing, just quit
-        {
-            transfer_stat=TransferStat_PostOperation;
-            emit internalStartPostOperation();
-        }
+        //Nothing is open before ifCanStartTransfer() (a retry closed its writer silently), and the
+        //"closed" flags are cleared by setFiles()/retry so remainFileOpen() reads true here anyway.
+        //Stopping never-opened threads waits for a closed() the write side does not send for an
+        //unopened file: the skip never completed and every later file was silently dropped (a
+        //collision dialog answered Skip). No post-operation either: nothing was written, the user's
+        //existing destination keeps its own dates/permissions.
         resetExtraVariable();
-        break;
+        transfer_stat=TransferStat_Idle;
+        if(!sended_state_postOperationStopped)
+        {
+            sended_state_postOperationStopped=true;
+            emit postOperationStopped();
+        }
+        return;
     case TransferStat_Transfer:
         if(needSkip)
         {
@@ -1324,7 +1333,7 @@ void TransferThreadAsync::skip()
             transfer_stat=TransferStat_PostOperation;
             emit internalStartPostOperation();
         }
-        if(!source.empty() && needRemove)
+        if(!source.empty() && needRemove && deletePartiallyTransferredFiles)
             if(exists(source) && source!=destination && destinationIsOursToRemove())
             {
                 UC_RSD("tt1293-unlink", destination);   // #23 read-salvage trace
@@ -1795,7 +1804,7 @@ void TransferThreadAsync::write_closed()
             // user's skip/remove button, also finalSkipNoRetry so the close handshake completes)
             // removes its partial like 3.0 did. Other stop/error teardowns still remove theirs.
             UC_RSD((finalSkipNoRetry&&(readError||writeError))?"tt1752-KEEP(salvage)":"tt1752-unlink", destination);
-            if(!finalSkipNoRetry || !(readError||writeError))
+            if(deletePartiallyTransferredFiles && (!finalSkipNoRetry || !(readError||writeError)))
                 unlink(destination);
             // --- END #23 read-salvage-drain ---
         }
@@ -1936,6 +1945,11 @@ void TransferThreadAsync::setNativeCopy(bool native_copy)
 
 void TransferThreadAsync::retryAfterError()
 {
+    emit internalStartRetryAfterError();
+}
+
+void TransferThreadAsync::retryAfterErrorInternal()
+{
     /// \warning skip the resetExtraVariable(); to be more exact and resolv some bug
     if(transfer_stat==TransferStat_Idle)
     {
@@ -1992,6 +2006,12 @@ void TransferThreadAsync::retryAfterError()
     writeIsOpenVariable=false;
     readError=false;
     writeError=false;*/
+    // a NEW attempt: every close event of the failed one was consumed before this queued slot ran, so
+    // the one-shot flags start fresh (a stale "closed" left here made the new attempt complete early)
+    readIsClosedVariable=false;
+    writeIsClosedVariable=false;
+    sended_state_readStopped=false;
+    sended_state_postOperationStopped=false;
     transfer_stat=TransferStat_PreOperation;
     writeThread.flushBuffer();
     emit internalStartPreOperation();

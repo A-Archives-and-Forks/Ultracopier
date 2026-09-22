@@ -569,6 +569,7 @@ void ReadThread::internalRead()
                                      ", error: "+errorString_internal+" ("+std::to_string(t)+")"
                                      );
             #endif
+            free(data);
             isInReadLoop=false;
             emit error();
             /// in version 2, full close and retry from open(), see comment into TransferThreadAsync::retryAfterError()
@@ -605,6 +606,8 @@ void ReadThread::internalRead()
             }
             lastGoodPosition+=sizeReaden;
         }
+        else
+            free(data);//EOF: nothing was handed to the writer, this block is still ours (one leak per file)
         /*
         if(lastGoodPosition>16*1024)
         {

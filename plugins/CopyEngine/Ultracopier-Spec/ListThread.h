@@ -7,6 +7,7 @@
 #define LISTTHREAD_H
 
 #include <QThread>
+#include <atomic>
 #include <QObject>
 #include <string>
 #include <vector>
@@ -327,6 +328,7 @@ private:
     static bool hasRemoteUrl(const std::vector<std::string> &sources, const std::string &destination);
     #endif
     std::vector<ScanFileOrFolder *> scanFileOrFolderThreadsPool;
+    std::atomic<bool>   newTransferAccepted;//result of newCopyInternal()/newMoveInternal(), read by the blocking caller
     int                 numberOfTransferIntoToDoList;
     std::vector<TransferThreadImpl *>		transferThreadList;
     ScanFileOrFolder *		newScanThread(Ultracopier::CopyMode mode);
@@ -430,6 +432,8 @@ private:
 private slots:
     void exportTransferListInternal(const std::string &fileName);
     void importTransferListInternal(const std::string &fileName);
+    void newCopyInternal(const std::vector<std::string> &sources,const std::string &destination);
+    void newMoveInternal(const std::vector<std::string> &sources,const std::string &destination);
 
     void scanThreadHaveFinishSlot();
     void scanThreadHaveFinish(bool skipFirstRemove=false);
@@ -489,6 +493,8 @@ private slots:
     void kioJobTotalAmount(KJob *job, KJob::Unit unit, qulonglong amount);
     #endif
 signals:
+    void newCopySend(const std::vector<std::string> &sources,const std::string &destination);
+    void newMoveSend(const std::vector<std::string> &sources,const std::string &destination);
     //send information about the copy
     void actionInProgess(const Ultracopier::EngineActionInProgress &) const;	//should update interface information on this event
 

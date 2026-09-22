@@ -214,7 +214,7 @@ void Filters::updateFilters()
             break;
         }
         if(include.at(index).need_match_all)
-            optionsToShow.push_back(tr("Full match").toStdString());
+            optionsToShow.push_back("need_match_all");//the stored token setFilters() parses, not the display text
         includeOptions.push_back(stringimplode(optionsToShow,";"));
         index++;
     }
@@ -253,7 +253,7 @@ void Filters::updateFilters()
             break;
         }
         if(exclude.at(index).need_match_all)
-            optionsToShow.push_back(tr("Full match").toStdString());
+            optionsToShow.push_back("need_match_all");
         excludeOptions.push_back(stringimplode(optionsToShow,";"));
         index++;
     }
@@ -266,7 +266,6 @@ bool Filters::convertToRegex(Filters_rules &item)
     bool isValid=!item.search_text.empty();
     if(isValid)
     {
-        std::regex regex;
         std::string tempString;
         if(item.search_type==SearchType_rawText)
         {
@@ -297,10 +296,9 @@ bool Filters::convertToRegex(Filters_rules &item)
         }
         if(isValid)
         {
-            if(item.need_match_all==true)
-                tempString="^"+tempString+"$";
-            regex=std::regex(tempString);
-            //isValid=regex.isValid();
+            const QRegularExpression regex(filterRegexPattern(QString::fromStdString(tempString),item.need_match_all));
+            if(!regex.isValid())
+                return false;
             item.regex=regex;
             return true;
         }

@@ -162,7 +162,16 @@ void MkPath::internalDoThisPath()
         }
     }
     if(TransferThread::is_dir(item.destination) && item.actionType==ActionType_RealMove)
-        pathList.front().actionType=ActionType_MovePath;
+    {
+        // the whole-folder rename was queued because the destination did NOT exist at scan time and
+        // it does now. Turning it into a plain MovePath (mkdir + rmdir of the source) transfers
+        // NOTHING and silently deletes a source made only of empty folders: ask instead.
+        if(stopIt)
+            return;
+        waitAction=true;
+        emit errorOnFolder(item.source,tr("The destination folder already exists").toStdString());
+        return;
+    }
     if(item.actionType!=ActionType_RealMove)
     {
         if(!TransferThread::is_dir(item.destination))
@@ -582,8 +591,13 @@ bool MkPath::rmpath(const INTERNALTYPEPATH &dir
         }
         else
         {
-            //return the fonction for scan the new folder
-            if(!rmpath(FSabsolutePath(dir)+TransferThread::stringToInternalString("/")+fileInfo.d_name+TransferThread::stringToInternalString("/")))
+            //return the fonction for scan the new folder (FSabsolutePath() of a slash-less dir is its PARENT)
+            INTERNALTYPEPATH child=dir;
+            if(!stringEndsWith(child,'/'))
+                child+='/';
+            child+=fileInfo.d_name;
+            child+='/';
+            if(!rmpath(child))
                 allHaveWork=false;
         }
     }

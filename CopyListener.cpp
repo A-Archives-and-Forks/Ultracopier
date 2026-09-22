@@ -44,7 +44,6 @@ CopyListener::CopyListener(OptionDialog *optionDialog)
     last_state=Ultracopier::NotListening;
     last_have_plugin=false;
     last_inWaitOfReply=false;
-    stripSeparatorRegex=std::regex("[\\\\/]+$");
 }
 
 CopyListener::~CopyListener()
@@ -272,7 +271,11 @@ std::vector<std::string> CopyListener::stripSeparator(std::vector<std::string> s
     unsigned int index=0;
     while(index<sources.size())
     {
-        std::regex_replace(sources[index],stripSeparatorRegex,"");
+        std::string &source=sources[index];
+        // drop the trailing separator(s) of a NAME only, never a root ("/", "C:\\")
+        while(source.size()>1 && (source.back()=='/' || source.back()=='\\')
+              && !(source.size()==3 && source[1]==':'))
+            source.pop_back();
         index++;
     }
     return sources;

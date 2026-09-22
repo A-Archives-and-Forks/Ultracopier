@@ -9,6 +9,8 @@ ScanFileOrFolder * ListThread::newScanThread(Ultracopier::CopyMode mode)
 {
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"start with: "+std::to_string(mode));
 
+    if(QThread::currentThread()!=this)//the pool and the options are only touched on the list thread
+        abort();
     //create new thread because is auto-detroyed
     scanFileOrFolderThreadsPool.push_back(new ScanFileOrFolder(mode));
     ScanFileOrFolder * scanFileOrFolderThreads=scanFileOrFolderThreadsPool.back();

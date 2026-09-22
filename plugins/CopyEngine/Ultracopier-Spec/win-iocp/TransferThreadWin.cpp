@@ -110,7 +110,7 @@ TransferThreadWin::TransferThreadWin()
         pipelineBuffers[i].bytesUsed=0;
         pipelineBuffers[i].fileOffset=0;
         pipelineBuffers[i].chunkSize=0;
-        memset(&pipelineBuffers[i].ov,0,sizeof(OVERLAPPED));
+        pipelineBuffers[i].ov=nullptr;
         pipelineBuffers[i].state=PipelineBuffer::Free;
     }
 
@@ -142,6 +142,9 @@ TransferThreadWin::~TransferThreadWin()
     for(char *p : orphanedBuffers)
         free(p);
     orphanedBuffers.clear();
+    for(OVERLAPPED *o : orphanedOverlapped)
+        free(o);
+    orphanedOverlapped.clear();
 }
 
 void TransferThreadWin::run()
@@ -204,6 +207,16 @@ void TransferThreadWin::initPipelineBuffers()
             }
             pipelineBuffers[i].allocSize=bs;
         }
+        if(pipelineBuffers[i].ov==nullptr)
+        {
+            pipelineBuffers[i].ov=(OVERLAPPED*)calloc(1,sizeof(OVERLAPPED));
+            if(pipelineBuffers[i].ov==nullptr)
+            {
+                errorString_internal="Out of memory allocating pipeline buffers";
+                emit errorOnFile(source,errorString_internal);
+                return;
+            }
+        }
         pipelineBuffers[i].bytesUsed=0;
         pipelineBuffers[i].state=PipelineBuffer::Free;
     }
@@ -216,6 +229,8 @@ void TransferThreadWin::freePipelineBuffers()
         free(pipelineBuffers[i].data);
         pipelineBuffers[i].data=nullptr;
         pipelineBuffers[i].allocSize=0;
+        free(pipelineBuffers[i].ov);
+        pipelineBuffers[i].ov=nullptr;
     }
 }
 
@@ -397,7 +412,7 @@ int TransferThreadWin::openDestFile(uint64_t startSize)
 int TransferThreadWin::bufferIndexForOverlapped(OVERLAPPED *ov)
 {
     for(int i=0;i<NUM_BUFFERS;i++)
-        if(&pipelineBuffers[i].ov==ov)
+        if(pipelineBuffers[i].ov==ov)
             return i;
     return -1;
 }
@@ -428,7 +443,7 @@ void TransferThreadWin::doTransferPipeline()
     // Initialize pipeline buffers
     initPipelineBuffers();
     for(int i=0;i<NUM_BUFFERS;i++)
-        if(pipelineBuffers[i].data==nullptr)
+        if(pipelineBuffers[i].data==nullptr || pipelineBuffers[i].ov==nullptr)
         {
             closeFiles();
             return; // error already emitted
@@ -453,7 +468,7 @@ void TransferThreadWin::doTransferPipeline()
     // completion packet is always posted to the IOCP otherwise, even when ReadFile
     // completes synchronously (we don't set FILE_SKIP_COMPLETION_PORT_ON_SUCCESS).
     auto issueRead=[&](int idx,char *ptr,unsigned int len,int64_t off)->bool{
-        OVERLAPPED &ov=pipelineBuffers[idx].ov;
+        OVERLAPPED &ov=*pipelineBuffers[idx].ov;
         memset(&ov,0,sizeof(OVERLAPPED));
         ov.Offset=(DWORD)((uint64_t)off & 0xFFFFFFFFULL);
         ov.OffsetHigh=(DWORD)((uint64_t)off >> 32);
@@ -471,7 +486,7 @@ void TransferThreadWin::doTransferPipeline()
     };
     // Issue an overlapped WriteFile on buffer idx at the given file offset.
     auto issueWrite=[&](int idx,char *ptr,unsigned int len,int64_t off)->bool{
-        OVERLAPPED &ov=pipelineBuffers[idx].ov;
+        OVERLAPPED &ov=*pipelineBuffers[idx].ov;
         memset(&ov,0,sizeof(OVERLAPPED));
         ov.Offset=(DWORD)((uint64_t)off & 0xFFFFFFFFULL);
         ov.OffsetHigh=(DWORD)((uint64_t)off >> 32);
@@ -579,9 +594,24 @@ void TransferThreadWin::doTransferPipeline()
                 }
                 else if(result==0 || isEof)
                 {
-                    // EOF
-                    pipelineBuffers[bufIdx].state=PipelineBuffer::Free;
+                    // EOF before the chunk was full: the source SHRANK since the scan. The bytes already
+                    // in the buffer are still written (the end-of-copy size check then reports the change).
                     readDone=true;
+                    if(pipelineBuffers[bufIdx].bytesUsed>0)
+                    {
+                        if(!issueWrite(bufIdx,pipelineBuffers[bufIdx].data,
+                                       (unsigned int)pipelineBuffers[bufIdx].bytesUsed,
+                                       pipelineBuffers[bufIdx].fileOffset))
+                        {
+                            writeError=true;
+                            errorOccurred=true;
+                            emit errorOnFile(destination,errorString_internal);
+                        }
+                        else
+                            writesInFlight++;
+                    }
+                    else
+                        pipelineBuffers[bufIdx].state=PipelineBuffer::Free;
                 }
                 else
                 {
@@ -740,6 +770,8 @@ void TransferThreadWin::doTransferPipeline()
                     orphanedBuffers.push_back(pipelineBuffers[i].data);
                     pipelineBuffers[i].data=nullptr;      // next initPipelineBuffers() mallocs a fresh block
                     pipelineBuffers[i].allocSize=0;
+                    orphanedOverlapped.push_back(pipelineBuffers[i].ov);// the wedged IRP still owns it too
+                    pipelineBuffers[i].ov=nullptr;
                     pipelineBuffers[i].state=PipelineBuffer::Free;
                 }
             if(iocpInitialized)
@@ -768,15 +800,35 @@ void TransferThreadWin::doTransferPipeline()
            bandwidth. Neither rsync nor the async backend fsync each file: the
            written data stays in the page cache and the kernel flushes it
            normally. A file copy does not need per-file durability. */
-        transferProgression=sourceFileSize;
-        // Whole file contiguously written -> resume water-mark equals the file size. (On the ERROR
-        // path leave contiguousWrittenOffset at its true mid-file value so resumeAfterErrorAndSeek()
-        // reads the real safe offset.)
-        contiguousWrittenOffset=(uint64_t)sourceFileSize;
+        if(transferProgression!=sourceFileSize)
+        {
+            // fewer bytes than the size at open: the source SHRANK while it was read (async parity:
+            // "File truncated during the read"); never claim the file complete
+            errorString_internal=tr("File truncated during the read, possible data change").toStdString();
+            ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] "+errorString_internal);
+            readError=true;
+            errorOccurred=true;
+            emit errorOnFile(source,errorString_internal);
+        }
+        else
+            // Whole file contiguously written -> resume water-mark equals the file size. (On the ERROR
+            // path leave contiguousWrittenOffset at its true mid-file value so resumeAfterErrorAndSeek()
+            // reads the real safe offset.)
+            contiguousWrittenOffset=(uint64_t)sourceFileSize;
     }
 
     ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Notice,"["+std::to_string(id)+"] doTransferPipeline end, transferred: "+std::to_string(transferProgression));
 }
+void TransferThreadWin::trimDestinationToContiguous()
+{
+    if(destHandle==INVALID_HANDLE_VALUE)
+        return;
+    LARGE_INTEGER pos;
+    pos.QuadPart=(LONGLONG)contiguousWrittenOffset;
+    if(!SetFilePointerEx(destHandle,pos,nullptr,FILE_BEGIN) || !SetEndOfFile(destHandle))
+        ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"["+std::to_string(id)+"] unable to trim the partial destination: "+winErrorString(GetLastError()));
+}
+
 bool TransferThreadWin::remainSourceOpen() const
 {
     return sourceHandle!=INVALID_HANDLE_VALUE;

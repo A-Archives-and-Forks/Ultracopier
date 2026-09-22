@@ -7,6 +7,7 @@
 #include <QRegularExpression>
 #include <QStorageInfo>
 #include <QTimer>
+#include <regex>
 
 #include "Environment.h"
 

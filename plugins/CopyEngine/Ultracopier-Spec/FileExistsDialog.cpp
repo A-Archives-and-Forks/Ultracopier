@@ -37,7 +37,7 @@ FileExistsDialog::FileExistsDialog(QWidget *parent, INTERNALTYPEPATH source,
     setWindowFlags(flags);
 
     ui->setupUi(this);
-    action=FileExists_Cancel;
+    action=FileExists_Cancel;//Esc/close keep Cancel: the whole job stops, like the button (deliberate)
     destinationInfo=TransferThread::internalStringTostring(destination);
     oldName=TransferThread::resolvedName(TransferThread::internalStringTostring(destination));
     ui->lineEditNewName->setText(QString::fromStdString(oldName));

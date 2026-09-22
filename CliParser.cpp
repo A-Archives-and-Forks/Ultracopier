@@ -11,10 +11,23 @@
 #endif
 //this is just to support clipboard
 #include <QClipboard>
+#include <QDir>
 #include <QGuiApplication>
 #include <QRegularExpression>
 
 #include <QDebug>
+
+/* The caller's working directory travels as argument 0 (LocalListener inserts it), so a RELATIVE
+ * path handed to the resident instance is resolved against the directory it was typed in, not the
+ * resident's own (typically $HOME): "cd /data && ultracopier mv notes.txt /backup" moved
+ * $HOME/notes.txt when it existed, else failed with "path not found". */
+static std::string resolveFromCallerDirectory(const std::string &callerDirectory,const std::string &path)
+{
+    if(path=="?" || path.empty() || path.find("://")!=std::string::npos
+            || QDir::isAbsolutePath(QString::fromStdString(path)))
+        return path;
+    return QDir(QString::fromStdString(callerDirectory)).absoluteFilePath(QString::fromStdString(path)).toStdString();
+}
 
 CliParser::CliParser(QObject *parent) :
     QObject(parent)
@@ -93,7 +106,7 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
         }
         else if(stringEndsWith(ultracopierArguments.back(),".urc"))
         {
-            tryLoadPlugin(ultracopierArguments.back());
+            tryLoadPlugin(resolveFromCallerDirectory(ultracopierArguments.at(0),ultracopierArguments.back()));
             return;
         }
         ULTRACOPIER_DEBUGCONSOLE(Ultracopier::DebugLevel_Warning,"Command line not understand");
@@ -106,7 +119,8 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
         {
             if(onlyCheck)
                 return;
-            QFile transferFile(QString::fromStdString(ultracopierArguments.back()));
+            const std::string transferListPath=resolveFromCallerDirectory(ultracopierArguments.at(0),ultracopierArguments.back());
+            QFile transferFile(QString::fromStdString(transferListPath));
             if(transferFile.open(QIODevice::ReadOnly))
             {
                 QString content;
@@ -151,7 +165,7 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
                  * "Ultracopier Spec", so opening a list Ultracopier had exported ITSELF always died
                  * with "Cannot find any engine with this name". An empty name = any compatible
                  * engine, which is what this format means. */
-                emit newTransferList(std::string(),transferListArguments.at(2),ultracopierArguments.back());
+                emit newTransferList(std::string(),transferListArguments.at(2),transferListPath);
             }
             else
             {
@@ -205,10 +219,11 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
                 }
                 else
                 {
+                    const std::string destination=resolveFromCallerDirectory(ultracopierArguments.at(0),ultracopierArguments.back());
                     if(ultracopierArguments.at(1)=="CBmv")
-                        emit newMove(sourceList,ultracopierArguments.back());
+                        emit newMove(sourceList,destination);
                     else
-                        emit newCopy(sourceList,ultracopierArguments.back());
+                        emit newCopy(sourceList,destination);
                 }
                 return;
             }
@@ -225,13 +240,15 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
     }
     else if(ultracopierArguments.size()>3)
     {
-        if(ultracopierArguments.at(1)=="Copy" || ultracopierArguments.at(1)=="cp")
+        if(ultracopierArguments.at(1)=="Copy" || ultracopierArguments.at(1)=="cp" || ultracopierArguments.at(1)=="CBcp")
         {
             if(onlyCheck)
                 return;
             std::vector<std::string> transferList=ultracopierArguments;
             transferList.erase(transferList.cbegin());//app path
             transferList.erase(transferList.cbegin());//command
+            for(std::string &path : transferList)
+                path=resolveFromCallerDirectory(ultracopierArguments.at(0),path);
             if(transferList.back()=="?")
             {
                 transferList.pop_back();
@@ -252,6 +269,8 @@ void CliParser::cli(const std::vector<std::string> &ultracopierArguments, const 
             std::vector<std::string> transferList=ultracopierArguments;
             transferList.erase(transferList.cbegin());//app path
             transferList.erase(transferList.cbegin());//command
+            for(std::string &path : transferList)
+                path=resolveFromCallerDirectory(ultracopierArguments.at(0),path);
             if(transferList.back()=="?")
             {
                 transferList.pop_back();

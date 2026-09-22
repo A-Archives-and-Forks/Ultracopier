@@ -37,7 +37,7 @@ FolderExistsDialog::FolderExistsDialog(QWidget *parent, INTERNALTYPEPATH source,
     setWindowFlags(flags);
 
     ui->setupUi(this);
-    action=FolderExists_Cancel;
+    action=FolderExists_Cancel;//Esc/close keep Cancel: the whole job stops, like the button (deliberate)
     oldName=TransferThread::resolvedName(TransferThread::internalStringTostring(destination));
     ui->lineEditNewName->setText(QString::fromStdString(oldName));
     ui->lineEditNewName->setPlaceholderText(QString::fromStdString(oldName));
